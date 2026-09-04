@@ -56,38 +56,26 @@ Do not create top-level directories outside this layout without saying why.
 2. **`WorldState` is the single source of truth.** Agent positions, statuses, task backlog, file locks, and token counters all live in one serializable object. Nothing derives world state from LangGraph internals or from the socket layer.
 3. **Every outbound message is a typed event.** Define it in `app/protocol/` as a Pydantic model, mirror it in `frontend/lib/protocol.ts`, and document it in `docs/PROTOCOL.md`. No ad-hoc dicts on the wire.
 4. **The protocol is versioned.** Every frame carries `v` (protocol version) and `seq` (monotonic mutation counter). `seq` counts state mutations, not frames — a batched frame advances it by more than one, so never test for adjacency. Clients reject non-increasing `seq` and resync via `GET /world/snapshot` on reconnect, on `world.desync`, or when an event references an unknown entity.
-5. **The frontend never calls an LLM and never holds an API key.** All model access is server-side. The browser bundle must contain no `ANTHROPIC_API_KEY`, no provider base URLs with credentials, and no `NEXT_PUBLIC_` variable carrying a secret.
+5. **The frontend never calls an LLM and never holds an API key.** All model access is server-side. The browser bundle must contain no provider API key, no provider base URLs with credentials, and no `NEXT_PUBLIC_` variable carrying a secret.
 6. **Agent tool calls are validated before execution.** Every tool has a Pydantic input schema. A malformed call produces a structured error fed back to the agent — it never raises into the graph runtime and never crashes the socket.
 
 ---
 
 ## 4. LLM usage rules
 
-**Default model is `claude-opus-5`.** Use the official Anthropic Python SDK (`anthropic`), never a raw `requests`/`httpx` call and never an OpenAI-compatible shim.
+**Nothing above `app/llm/` may import a provider SDK.** Agent personas, the graph, and the world talk in `Message`, `ToolSpec`, `LLMResponse`, and `StopReason` — never in OpenAI or Ollama types. Provider selection happens once, in `app/llm/factory.py`. If you find yourself writing `if provider == ...` outside that file, the abstraction has leaked.
 
-```python
-response = client.messages.create(
-    model="claude-opus-5",
-    max_tokens=16000,
-    thinking={"type": "adaptive"},
-    output_config={"effort": "high"},
-    messages=messages,
-    tools=tools,
-)
-```
+Current setup: **OpenAI is primary, Ollama is the local-dev fallback.** Both sit behind `LLMProvider`; `FakeProvider` stands in for tests.
 
-Rules:
-
-- **Model IDs:** `claude-opus-5` for planning, architecture, and code generation. `claude-haiku-4-5` for cheap classification, routing, and status summarization. Never append date suffixes to these IDs.
-- **Thinking:** thinking is on by default on `claude-opus-5`; `{"type": "adaptive"}` is equivalent and is what we write explicitly. Never use `budget_tokens` — it returns a 400. Control depth with `output_config.effort`.
-- **`max_tokens` and thinking share one budget.** `max_tokens` caps thinking plus response text together. Size it generously (16000 non-streaming, 64000 streaming) or answers truncate mid-thought.
-- **Sampling parameters are rejected.** Do not pass `temperature`, `top_p`, or `top_k` — they return a 400 on `claude-opus-5`. Steer behavior with prompting.
-- **No assistant prefills.** A trailing `{"role": "assistant", ...}` message returns a 400. Use `output_config.format` (structured outputs) when you need a guaranteed JSON shape.
-- **Stream anything with `max_tokens` above ~16000.** Use `client.messages.stream(...)` and `.get_final_message()` to avoid HTTP timeouts.
-- **Check `stop_reason` before reading `content`.** Safety classifiers can return HTTP 200 with `stop_reason: "refusal"` and an empty `content` array; indexing `content[0]` unconditionally will crash. Handle `refusal`, `max_tokens`, `pause_turn`, and `tool_use` explicitly.
-- **Prompt caching:** the persona system prompt and the tool list are the cache prefix. Keep them byte-stable — never interpolate a timestamp, session ID, or agent position into the system prompt. Dynamic context goes into `messages`, after the last `cache_control` breakpoint. Verify with `usage.cache_read_input_tokens`.
-- **Ollama is the local-dev fallback only.** It lives behind the same `LLMProvider` interface as the Anthropic client. Provider selection is a config value, never a branch scattered through agent code.
-- **Token accounting is mandatory.** Every model call records `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and the model ID against the calling agent. The worker tray displays these; without accounting we cannot tune cost.
+- **Model IDs are configuration, never literals.** `PLANNING_MODEL` (planning, architecture, code generation) and `UTILITY_MODEL` (routing, classification, status text) come from the environment and have no defaults. A guessed ID 404s at request time inside a retry loop; a missing one fails loudly at startup. Do not hardcode a model ID anywhere, including in tests.
+- **Normalize at the boundary, not downstream.** Each provider maps its own accounting into the four-field `TokenUsage` and its own finish reasons into `StopReason`. Two rules follow:
+  - `input_tokens` means the **uncached remainder**, so a provider reporting a total prompt count (OpenAI's `prompt_tokens`) must subtract the cached portion. The invariant `input + cache_creation + cache_read == total prompt` is tested; breaking it inflates every cost display.
+  - Adding a provider must not add a control-flow path. If it needs a new `StopReason`, add the member and handle it everywhere — do not smuggle a provider string through.
+- **Translate provider exceptions.** Nothing provider-specific escapes `app/llm/`. Raise `RateLimited` or `LLMError(retryable=...)` so backoff logic stays provider-agnostic (PLAN.md §7, Scenario 3).
+- **Check `stop_reason` before using the response.** Handle `END_TURN`, `TOOL_USE`, `MAX_TOKENS`, and `REFUSAL` explicitly. A refusal or a truncation is a real outcome the agent must react to, not an exception.
+- **Malformed tool arguments are data, not crashes.** A model can emit invalid JSON for tool arguments. Providers pass it through as `{"__malformed__": ...}` so the tool's own Pydantic validation produces the correction message the agent needs (Scenario 2). Never let a `JSONDecodeError` reach the graph.
+- **Keep the system prompt byte-stable.** Persona prompts are files, not f-strings. Never interpolate a timestamp, session id, or agent position into a system prompt — it destroys prompt-cache hits on every provider that offers them. Dynamic context goes into `messages`.
+- **Token accounting is mandatory.** Every model call records all four token fields plus the model ID against the calling agent and emits `agent.usage`. The worker tray shows cumulative *total* prompt tokens, not `input_tokens` alone — displaying the uncached remainder alone under-reports by an order of magnitude once caching kicks in.
 
 ---
 
@@ -174,6 +162,11 @@ npm run build
 # Regenerate the office map after editing scripts/gen_map.py.
 # Writes both copies (canonical + the one Next serves) and asserts connectivity.
 python3 scripts/gen_map.py
+
+# Live provider check — three real calls, costs a few hundred tokens.
+# Run after changing provider, model IDs, or anything in app/llm/.
+# Deliberately not part of pytest: the suite stays runnable with no credentials.
+cd backend && uv run python ../scripts/smoke_provider.py
 ```
 
 Debug harness (Phase 1, retained as the Phase 4 fault-injection entry point):
@@ -199,11 +192,19 @@ which goes green independently and earlier.
 Required environment (`backend/.env`):
 
 ```
-ANTHROPIC_API_KEY=...
-LLM_PROVIDER=anthropic          # anthropic | ollama
-PLANNING_MODEL=claude-opus-5
-UTILITY_MODEL=claude-haiku-4-5
+LLM_PROVIDER=openai             # openai | ollama
+OPENAI_API_KEY=...              # required when LLM_PROVIDER=openai
+OPENAI_BASE_URL=                # optional: gateway / compatible endpoint
 OLLAMA_BASE_URL=http://localhost:11434
+
+# No defaults. Startup fails if either is missing or blank.
+PLANNING_MODEL=
+UTILITY_MODEL=
+
 WORKSPACE_ROOT=/absolute/path/to/agent/workspace
 MAX_STEPS_PER_SUBTASK=10
 ```
+
+Never paste a key into a chat, an issue, or a commit. `.env` is gitignored;
+keep it that way. A key that has appeared in a transcript is compromised —
+rotate it rather than reusing it.

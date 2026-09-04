@@ -164,12 +164,12 @@ def test_usage_accumulates_all_four_fields() -> None:
 
     w.record_usage(
         "coder-1",
-        "claude-opus-5",
+        "planning-model",
         TokenUsage(input_tokens=100, output_tokens=50, cache_read_input_tokens=8192),
     )
     w.record_usage(
         "coder-1",
-        "claude-opus-5",
+        "planning-model",
         TokenUsage(input_tokens=20, output_tokens=10, cache_creation_input_tokens=1024),
     )
 

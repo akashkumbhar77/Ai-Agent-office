@@ -30,9 +30,9 @@ Decisions taken up front so they are not relitigated mid-build. Each records the
 | Orchestration | **LangGraph** | CrewAI — weaker support for cyclic graphs, checkpointing, and mid-run human interrupts, which are exactly the mechanics Scenarios 5 and 6 need |
 | Graph persistence | LangGraph checkpointer, SQLite-backed | In-memory only — loses the ability to resume a workflow after a backend restart |
 | API / transport | **FastAPI + native WebSockets** | Socket.IO — extra protocol layer for reconnection logic we control anyway |
-| Primary model | **`claude-opus-5`** (adaptive thinking, `effort: high`) | Fixed thinking budgets — `budget_tokens` returns a 400 on this model |
-| Utility model | **`claude-haiku-4-5`** for routing, classification, status text | Using Opus for everything — 5× the cost for work that does not need it |
-| Local fallback | **Ollama** behind an `LLMProvider` interface | Provider-specific branches scattered through agent code |
+| Primary provider | **OpenAI** behind the `LLMProvider` interface | Anthropic — no credentials available for this build; the interface makes it a later drop-in, not a rewrite |
+| Model IDs | **Configuration only** (`PLANNING_MODEL`, `UTILITY_MODEL`), no defaults | Hardcoded IDs — a wrong guess 404s inside a retry loop instead of failing at startup |
+| Local fallback | **Ollama** behind the same interface | Provider-specific branches scattered through agent code |
 | World state | Single in-memory `WorldState` (Pydantic) — Redis deferred to Phase 4 | Redis from day one — premature; single-process is the v1 topology |
 | Rendering | **Phaser 3** in a client-only React component | PixiJS — Phaser ships tilemap parsing, arcade physics, and animation state out of the box |
 | Movement | Backend sends **movement intent**; frontend runs A\* and tweens | Backend streaming coordinates at 30 Hz — couples render rate to network, floods the socket |
@@ -154,10 +154,10 @@ Events are queued and flushed on a 100 ms tick, coalesced into a single frame ar
 
 Four personas as LangGraph nodes over a shared state object.
 
-- **Product Manager** — decomposes the operator's macro objective into an epic and ordered tasks. Runs on `claude-opus-5` at `effort: high`; the quality of decomposition determines everything downstream.
-- **Lead Architect / Coder** — claims a task, reads context, writes code, runs tests. Highest token consumer. `claude-opus-5`, streaming, generous `max_tokens`.
+- **Product Manager** — decomposes the operator's macro objective into an epic and ordered tasks. Runs on `PLANNING_MODEL`; the quality of decomposition determines everything downstream.
+- **Lead Architect / Coder** — claims a task, reads context, writes code, runs tests. Highest token consumer. `PLANNING_MODEL`, generous `max_tokens`.
 - **Code Reviewer / QA** — inspects the diff, runs linters, returns `approve` or a structured rejection with reasons. Structured output enforced via `output_config.format`, so the graph branches on a parsed field rather than on prose.
-- **Technical Writer** — updates documentation from the merged diff. Cheapest path; `claude-haiku-4-5` is usually sufficient.
+- **Technical Writer** — updates documentation from the merged diff. Cheapest path; `UTILITY_MODEL` is usually sufficient.
 
 ### Edges
 

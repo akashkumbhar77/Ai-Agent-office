@@ -149,7 +149,7 @@ Emitted after every model call. Cumulative totals live in `AgentState.usage`; th
 { "type": "agent.usage",
   "data": {
     "agent_id": "coder-1",
-    "model": "claude-opus-5",
+    "model": "<PLANNING_MODEL>",
     "input_tokens": 1204,
     "output_tokens": 830,
     "cache_creation_input_tokens": 0,
@@ -157,7 +157,15 @@ Emitted after every model call. Cumulative totals live in `AgentState.usage`; th
   } }
 ```
 
-The four token fields mirror the Anthropic `usage` object exactly. Total prompt size is `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` — `input_tokens` alone is the uncached remainder, so a tray that displays only it will under-report by an order of magnitude on a cached session.
+These four fields are provider-neutral; each provider normalizes its own accounting into them at the `LLMProvider` boundary and nowhere else. The invariant is:
+
+```
+total prompt = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+```
+
+`input_tokens` is the **uncached remainder**, not the whole prompt. A provider that reports a total prompt count including its cached prefix (OpenAI's `prompt_tokens`) must subtract the cached portion before filling `input_tokens`, or every cached call double-counts. A tray displaying `input_tokens` alone will under-report by an order of magnitude on a cached session — show the sum.
+
+`cache_creation_input_tokens` stays `0` on providers with no separate cache-write metric.
 
 ### 4.6 `task.update`
 

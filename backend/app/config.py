@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,16 +14,21 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # --- LLM ---------------------------------------------------------------
-    llm_provider: Literal["anthropic", "ollama"] = "anthropic"
-    anthropic_api_key: str | None = None
-    planning_model: str = "claude-opus-5"
-    utility_model: str = "claude-haiku-4-5"
+    llm_provider: Literal["openai", "ollama"] = "openai"
+    openai_api_key: str | None = None
+    # Optional override for gateways and compatible endpoints.
+    openai_base_url: str | None = None
     ollama_base_url: str = "http://localhost:11434"
 
-    # Thinking is on by default on claude-opus-5 and shares max_tokens with the
-    # response text. Sized for streaming; see CLAUDE.md §4.
-    max_tokens: int = 64000
-    effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
+    # Deliberately no defaults, and min_length=1 so a blank value in .env is
+    # rejected too. A guessed or empty model ID fails at request time with a
+    # 404 buried in a retry loop; a missing one fails at startup with a clear
+    # message. Set both in .env.
+    planning_model: str = Field(min_length=1)
+    utility_model: str = Field(min_length=1)
+
+    max_tokens: int = 8192
+    max_llm_retries: int = 4
 
     # --- Agent safety ------------------------------------------------------
     workspace_root: Path
@@ -48,10 +53,14 @@ class Settings(BaseSettings):
             raise ValueError(f"WORKSPACE_ROOT is not a directory: {resolved}")
         return resolved
 
-    def require_anthropic_key(self) -> str:
-        if self.llm_provider == "anthropic" and not self.anthropic_api_key:
-            raise RuntimeError("LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is unset")
-        return self.anthropic_api_key or ""
+    @model_validator(mode="after")
+    def _require_provider_credentials(self) -> Settings:
+        if self.llm_provider == "openai" and not self.openai_api_key:
+            raise ValueError(
+                "LLM_PROVIDER=openai but OPENAI_API_KEY is unset. Set it in "
+                "backend/.env (gitignored) or export it."
+            )
+        return self
 
 
 @lru_cache
