@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.sqlite
+*.db
+
+# Node
+node_modules/
+.next/
+out/
+
+# Secrets & local config
+.env
+.env.local
+
+# Agent workspace (agents write real files here)
+workspace/

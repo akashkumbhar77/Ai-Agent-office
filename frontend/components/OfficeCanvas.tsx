@@ -1,0 +1,73 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+
+// This module is only ever loaded through a dynamic import with ssr:false
+// (see app/page.tsx), so a static Phaser import is safe here — Phaser touches
+// `window` at module scope and must not be evaluated on the server.
+// Namespace import: the package has no default export.
+import * as Phaser from "phaser";
+
+import { OfficeScene } from "@/game/OfficeScene";
+import type { Tile } from "@/lib/protocol";
+import { FableSocket } from "@/lib/ws";
+
+const WIDTH = 30 * 32;
+const HEIGHT = 20 * 32;
+
+interface Props {
+  sessionId: string;
+  onTileClick: (tile: Tile) => void;
+}
+
+export default function OfficeCanvas({ sessionId, onTileClick }: Props) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const [ready, setReady] = useState(false);
+  // Held in a ref so a changed handler does not tear down and rebuild Phaser.
+  const clickRef = useRef(onTileClick);
+  clickRef.current = onTileClick;
+
+  useEffect(() => {
+    if (!hostRef.current) return;
+
+    setReady(false);
+    const scene = new OfficeScene();
+    scene.tileClickHandler = (tile) => clickRef.current(tile);
+    scene.readyHandler = () => setReady(true);
+
+    const game = new Phaser.Game({
+      type: Phaser.AUTO,
+      parent: hostRef.current,
+      width: WIDTH,
+      height: HEIGHT,
+      backgroundColor: "#0b0e14",
+      pixelArt: true,
+      scene: [scene],
+      // Cap the canvas at 30fps: a burst of socket events must not become a
+      // burst of frames (CLAUDE.md §6).
+      fps: { target: 30, forceSetTimeOut: true },
+      scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
+    });
+
+    const socket = new FableSocket(sessionId);
+    socket.connect();
+
+    return () => {
+      socket.close();
+      game.destroy(true);
+    };
+  }, [sessionId]);
+
+  return (
+    <div
+      ref={hostRef}
+      // The scene ignores clicks until create() has run. Exposing readiness
+      // lets the page dim the canvas while it boots, and lets the e2e suite
+      // wait for a real signal instead of a sleep.
+      data-scene-ready={ready ? "true" : "false"}
+      className={`w-full overflow-hidden rounded-lg border border-slate-800 bg-[#0b0e14] transition-opacity ${
+        ready ? "opacity-100" : "opacity-60"
+      }`}
+    />
+  );
+}
