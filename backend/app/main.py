@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import Settings, get_settings
+from app.llm.factory import build_provider
 from app.protocol.events import (
     CLOSE_MALFORMED_MESSAGE,
     CLOSE_UNKNOWN_SESSION,
@@ -45,7 +46,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         desks=len(tilemap.desks),
     )
 
-    session = Session(DEFAULT_SESSION, tilemap, settings.tick_interval_ms)
+    provider = build_provider(settings)
+    log.info(
+        "provider_ready",
+        provider=provider.name,
+        planning=settings.planning_model,
+        utility=settings.utility_model,
+    )
+
+    session = Session(DEFAULT_SESSION, tilemap, settings, provider)
     session.start()
     sessions[DEFAULT_SESSION] = session
     log.info("session_started", session_id=DEFAULT_SESSION)
@@ -142,6 +151,20 @@ async def debug_move(req: DebugMoveRequest) -> dict[str, object]:
 
     await session.flush()  # deliver immediately rather than waiting for the tick
     return {"ok": True, "seq": session.world.seq}
+
+
+class PromptRequest(BaseModel):
+    text: str = Field(min_length=1)
+    session_id: str = DEFAULT_SESSION
+
+
+@app.post("/prompt")
+async def submit_prompt(req: PromptRequest) -> dict[str, object]:
+    """Start an agent run. The same path prompt.submit takes over the socket."""
+    session = require_session(req.session_id)
+    if not session.submit(req.text):
+        raise HTTPException(status_code=409, detail="a run is already in flight")
+    return {"ok": True, "objective": req.text}
 
 
 @app.websocket("/ws/{session_id}")

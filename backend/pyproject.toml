@@ -14,6 +14,7 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=2.0",
     "httpx>=0.27",
     "openai>=3.8.0",
+    "aiosqlite>=0.22.1",
 ]
 
 [dependency-groups]
@@ -32,7 +33,7 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["app/protocol", "app/world", "app/tools", "app/llm"]
+files = ["app/protocol", "app/world", "app/tools", "app/llm", "app/agents", "app/graph", "app/transport", "app/main.py"]
 
 [tool.ruff]
 line-length = 100

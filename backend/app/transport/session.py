@@ -9,46 +9,72 @@ from datetime import UTC, datetime
 import structlog
 from fastapi import WebSocket
 
+from app.agents.personas import ROSTER
+from app.agents.toolbox import Toolbox
+from app.config import Settings
+from app.graph.workflow import Workbench, build_workflow
+from app.llm.base import LLMProvider
 from app.protocol.events import (
     AgentStatus,
     ClientFrame,
-    Persona,
     ServerEvent,
     ServerFrame,
     Tile,
     dump_frame,
 )
+from app.tools.filesystem import FileTools
+from app.tools.shell import ShellTool
+from app.tools.workspace import Workspace
 from app.transport.coalesce import coalesce
 from app.world.state import World
 from app.world.tilemap import TileMap
 
 log = structlog.get_logger(__name__)
 
-# The four personas from PLAN.md §5, seated at the first four desks.
-ROSTER: list[tuple[str, Persona, str]] = [
-    ("pm-1", Persona.PM, "Iris"),
-    ("coder-1", Persona.ARCHITECT, "Ada"),
-    ("reviewer-1", Persona.REVIEWER, "Bo"),
-    ("writer-1", Persona.WRITER, "Cy"),
-]
-
 
 class Session:
-    def __init__(self, session_id: str, tilemap: TileMap, tick_interval_ms: int) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        tilemap: TileMap,
+        settings: Settings,
+        provider: LLMProvider,
+        checkpointer: object | None = None,
+    ) -> None:
         self.session_id = session_id
         self.tilemap = tilemap
-        self.tick_interval = tick_interval_ms / 1000
+        self.settings = settings
+        self.tick_interval = settings.tick_interval_ms / 1000
         self.world = World(session_id=session_id, map_id=tilemap.map_id)
         self._clients: set[WebSocket] = set()
         self._tick_task: asyncio.Task[None] | None = None
         self._arrivals: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
+        self._run: asyncio.Task[None] | None = None
 
         self._seed_agents()
 
+        workspace = Workspace(settings.workspace_root)
+        files, shell = FileTools(workspace), ShellTool(workspace)
+        self.bench = Workbench(
+            world=self.world,
+            tilemap=tilemap,
+            provider=provider,
+            settings=settings,
+            toolboxes={
+                spec.agent_id: Toolbox(files, shell, spec.tool_names) for spec in ROSTER
+            },
+            # Route movement through the session so an arrival is scheduled
+            # and the agent's target clears when it gets there.
+            mover=self.move,
+        )
+        self.workflow = build_workflow(self.bench, checkpointer=checkpointer)
+
     def _seed_agents(self) -> None:
-        for (agent_id, persona, name), desk in zip(ROSTER, self.tilemap.desks, strict=False):
-            self.world.spawn_agent(agent_id, persona, name, desk)
+        for spec, desk in zip(ROSTER, self.tilemap.desks, strict=False):
+            self.world.spawn_agent(
+                spec.agent_id, spec.persona, spec.display_name, desk
+            )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -57,7 +83,7 @@ class Session:
             self._tick_task = asyncio.create_task(self._tick_loop())
 
     async def stop(self) -> None:
-        for task in (self._tick_task, *self._arrivals.values()):
+        for task in (self._tick_task, self._run, *self._arrivals.values()):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -152,16 +178,63 @@ class Session:
             return
         async with self._lock:
             self.world.arrive(agent_id)
-            self.world.set_status(agent_id, AgentStatus.IDLE)
+            # Only settle to idle if the agent is still walking. An agent that
+            # started working the moment it set off must keep that status —
+            # otherwise every move silently resets it 2.4s later.
+            if self.world.agents[agent_id].status is AgentStatus.WALKING:
+                self.world.set_status(agent_id, AgentStatus.IDLE)
         self._arrivals.pop(agent_id, None)
 
     async def handle_client_frame(self, frame: ClientFrame) -> None:
         for message in frame.events:
+            log.info("client_message", session_id=self.session_id, type=message.type)
+
+            if message.type == "prompt.submit":
+                self.submit(message.data.text)
+            elif message.type == "session.pause":
+                self.cancel_run()
+            # session.resume restarts from a checkpoint and escalation.resolve
+            # becomes a graph interrupt — both land in Phase 4.
+
+    # -- agent runs --------------------------------------------------------
+
+    @property
+    def busy(self) -> bool:
+        return self._run is not None and not self._run.done()
+
+    def submit(self, objective: str) -> bool:
+        """Start a run for an operator objective.
+
+        Returns False if one is already in flight. A second concurrent run
+        would have two agents fighting over the same desks and files, so the
+        objective is refused rather than queued silently.
+        """
+        if self.busy:
+            log.warning("run_rejected_busy", session_id=self.session_id)
+            return False
+        self._run = asyncio.create_task(self._execute(objective))
+        return True
+
+    def cancel_run(self) -> None:
+        if self._run is not None and not self._run.done():
+            self._run.cancel()
+
+    async def _execute(self, objective: str) -> None:
+        config = {"configurable": {"thread_id": f"{self.session_id}-run"}}
+        try:
+            result = await self.workflow.ainvoke({"objective": objective}, config=config)
             log.info(
-                "client_message",
+                "run_finished",
                 session_id=self.session_id,
-                type=message.type,
+                completed=len(result.get("completed") or []),
+                failure=result.get("failure"),
             )
-            # Phase 2 wires prompt.submit into the graph; Phase 4 wires
-            # escalation.resolve into the interrupt. Logged for now so the
-            # transport path is exercised end to end.
+        except asyncio.CancelledError:
+            log.info("run_cancelled", session_id=self.session_id)
+            raise
+        except Exception:
+            # A crashed run must not take the session with it; the operator
+            # keeps their office and can try again.
+            log.exception("run_failed", session_id=self.session_id)
+        finally:
+            await self.flush()
