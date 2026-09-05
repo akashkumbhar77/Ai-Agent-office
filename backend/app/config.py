@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -31,6 +32,12 @@ class Settings(BaseSettings):
     workspace_root: Path
     max_steps_per_subtask: int = 10
     max_tool_retries: int = 3
+
+    # Isolation for agent-run shell commands. `auto` uses bubblewrap when it
+    # is installed and degrades — visibly, with a banner in the office — when
+    # it is not. `bwrap` requires it and fails at startup otherwise. `off`
+    # runs commands on the bare host and is for development only.
+    sandbox: Literal["auto", "bwrap", "off"] = "auto"
 
     # --- Graph persistence -------------------------------------------------
     # Where LangGraph checkpoints live. Required, not optional: an escalation

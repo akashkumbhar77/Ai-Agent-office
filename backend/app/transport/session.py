@@ -19,6 +19,9 @@ from app.graph.workflow import Workbench, build_workflow
 from app.llm.base import LLMProvider
 from app.protocol.events import (
     AgentStatus,
+    Alert,
+    AlertKind,
+    AlertSeverity,
     ClientFrame,
     RunPhase,
     ServerEvent,
@@ -27,7 +30,8 @@ from app.protocol.events import (
     dump_frame,
 )
 from app.tools.filesystem import FileTools
-from app.tools.shell import ShellTool
+from app.tools.sandbox import build as build_sandbox
+from app.tools.shell import INERT_ALLOWLIST, ShellTool
 from app.tools.workspace import Workspace
 from app.transport.coalesce import coalesce
 from app.world.state import World
@@ -66,7 +70,14 @@ class Session:
         self._seed_agents()
 
         workspace = Workspace(settings.workspace_root)
-        files, shell = FileTools(workspace), ShellTool(workspace)
+        self.sandbox = build_sandbox(settings.sandbox, workspace.root)
+        files = FileTools(workspace)
+        shell = ShellTool(workspace, sandbox=self.sandbox)
+        if self.sandbox is None:
+            # Raised before the first client connects, so it is already in the
+            # opening snapshot: an operator must never have to have been
+            # watching at the right moment to learn the sandbox is off.
+            self._warn_unsandboxed()
         self.bench = Workbench(
             world=self.world,
             tilemap=tilemap,
@@ -80,6 +91,34 @@ class Session:
             mover=self.move,
         )
         self.workflow = build_workflow(self.bench, checkpointer=checkpointer)
+
+    def _warn_unsandboxed(self) -> None:
+        """Make a degraded security posture impossible to miss.
+
+        A warning in the server log is not enough: the operator is looking at
+        the office, not at stderr. This is the same reasoning that puts every
+        agent failure on the wire — a state nobody can see is a state nobody
+        accounts for.
+        """
+        self.world.raise_alert(
+            Alert(
+                alert_id="sandbox-degraded",
+                severity=AlertSeverity.WARNING,
+                kind=AlertKind.PROVIDER_ERROR,
+                message=(
+                    "Commands are running without isolation. Agents can only "
+                    "use read-only tools; interpreters and package runners "
+                    "are disabled. Install bubblewrap to enable them."
+                ),
+                actions=[],
+                raised_at=datetime.now(UTC),
+            )
+        )
+        log.warning(
+            "sandbox_degraded",
+            session_id=self.session_id,
+            allowed=sorted(INERT_ALLOWLIST),
+        )
 
     def _seed_agents(self) -> None:
         for spec, desk in zip(ROSTER, self.tilemap.desks, strict=False):

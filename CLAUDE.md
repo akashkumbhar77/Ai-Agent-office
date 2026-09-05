@@ -123,8 +123,10 @@ Rules that follow from this table:
 ## 8. Security
 
 - Agents execute code and touch the filesystem. **Confine every file operation to the configured workspace root.** Resolve model-supplied paths to canonical form and reject anything that escapes the root (`..`, symlinks, absolute paths). Never pass a raw model-supplied path to `open()`.
-- Shell commands from agents run against an **allowlist** of executables, with shell operators (`&&`, `|`, `;`, backticks, `$()`) rejected. A blocklist is not sufficient. Prefer running them in a container.
-- **Known gap, do not assume otherwise:** `ShellTool` checks `argv[0]` and nothing else. Arguments never reach the `resolve()` chokepoint, so shell commands are *not* confined to the workspace, and the allowlist includes interpreters. The rule above is the target, not the current state — see `docs/PLAN.md` §6 Phase 5.1. Anything you build that relies on shell confinement is relying on something that is not there yet.
+- Shell commands from agents run **inside a bubblewrap sandbox** (`app/tools/sandbox.py`): no network, no host filesystem, no inherited environment, workspace bound read-write. That is the security boundary. Everything else below it is a guardrail.
+- Every shell **argument** goes through the same `Workspace.resolve()` chokepoint as the file tools. An argument that could name a path outside the workspace is rejected whether or not it was meant as one — fail closed on the ambiguity.
+- The **allowlist follows the isolation.** With a sandbox, agents get interpreters and runners (`python`, `npm`, `npx`, `git`); without one they get `INERT_ALLOWLIST` only. An allowlist containing an interpreter was never a boundary — `python -c` runs anything — so it must not be treated as one. Shell operators (`&&`, `|`, `;`, backticks, `$()`) are rejected on tokens, not on the raw string.
+- **Degradation is visible, never silent.** No sandbox means a standing `warning` alert in the office naming what is disabled. A security posture that weakens quietly is one nobody notices has weakened.
 - Secrets live in `.env` (gitignored) and reach the process as environment variables. They never enter a prompt, a log line, a WebSocket frame, or the frontend bundle.
 - Treat all agent-authored content as untrusted input to the rest of the system, including to other agents.
 

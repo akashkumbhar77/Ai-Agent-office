@@ -89,11 +89,14 @@ test.describe("@live command center", () => {
     await expect(page.locator("pre").first()).toBeVisible({ timeout: 180_000 });
     await page.screenshot({ path: "e2e/artifacts/12-log.png", fullPage: true });
 
-    // A real file change lands on the files tab.
+    // A real file change lands on the files tab. Scoped to the inspector on
+    // purpose: the prompt bar echoes the objective, which names the same
+    // file, so a page-wide match passes the instant the run starts and
+    // proves nothing.
     await page.getByRole("button", { name: /^files/ }).click();
-    await expect(page.getByText(TARGET_FILE).first()).toBeVisible({
-      timeout: 300_000,
-    });
+    await expect(
+      page.locator("aside").filter({ hasText: "Inspector" }).getByText(TARGET_FILE).first(),
+    ).toBeVisible({ timeout: 300_000 });
     await page.screenshot({ path: "e2e/artifacts/13-files.png", fullPage: true });
 
     // And the task reaches a terminal state.

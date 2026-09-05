@@ -47,6 +47,7 @@ PLANNING_MODEL=gpt-5.5
 UTILITY_MODEL=gpt-5.4-mini
 WORKSPACE_ROOT=/absolute/path/to/project-fable/workspace
 MAX_STEPS_PER_SUBTASK=10
+SANDBOX=auto
 ENV
 
 # 3. Dependencies
@@ -216,21 +217,34 @@ becoming a mysterious pathfinding bug later.
 
 ## Safety
 
-Agents write files and run commands.
+Agents write files and run commands. Three layers stop that reaching the rest
+of the machine:
 
-**Run this on a machine you would be willing to hand to a stranger, or inside
-a VM.** The file tools are confined — every path is resolved to canonical form
-and rejected if it escapes `WORKSPACE_ROOT`. The **shell tool is not**: it
-checks only the name of the program, never its arguments, so an allowlisted
-`cat` reads any file on the host, and the allowlist includes `python`, `npm`,
-`npx` and `git` — which are arbitrary code execution and network access.
-Pointing `WORKSPACE_ROOT` at a scratch directory bounds what the *file* tools
-touch and nothing else.
+1. **A sandbox.** Shell commands run under [bubblewrap](https://github.com/containers/bubblewrap)
+   with no network, no host filesystem, and no inherited environment — so the
+   agent cannot read the API key the backend was started with. The workspace
+   is bound read-write at its real path, so tracebacks name files you can
+   open. Install it with `apt install bubblewrap` (Debian/Ubuntu) or
+   `dnf install bubblewrap` (Fedora).
+2. **Path confinement.** Every file path *and every shell argument* is
+   resolved to canonical form and rejected if it escapes `WORKSPACE_ROOT`.
+   That covers `..`, symlinks, and both combined.
+3. **An allowlist**, which follows the isolation. With the sandbox running,
+   agents get `python`, `pytest`, `npm`, `git` and friends. Without it they
+   get read-only tools only — an allowlist containing an interpreter is not a
+   security boundary, because `python -c` runs anything.
 
-This is a known gap with a confirmed reproduction, not a theoretical one; the
-fix is `docs/PLAN.md` §6 Phase 5.1 — argument confinement, then a container.
-Until it lands, treat a running agent as having the same reach as the account
-the backend runs under.
+```bash
+SANDBOX=auto    # default: use bubblewrap if installed, degrade visibly if not
+SANDBOX=bwrap   # require it; fail at startup if missing
+SANDBOX=off     # development only
+```
+
+**If the sandbox is not running, the office says so** — a standing amber
+banner naming what is disabled. Check for it before pointing this at anything
+you care about. Still keep `WORKSPACE_ROOT` on a scratch directory: the
+sandbox stops an agent leaving the workspace, not from making a mess inside
+it.
 
 Secrets live in `backend/.env`, which is gitignored, and reach the process as
 environment variables. They never enter a prompt, a log line, a WebSocket

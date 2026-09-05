@@ -251,6 +251,94 @@ def test_allowlist_bypass_via_path_prefix_is_refused(shell: ShellTool) -> None:
     assert "not an allowed command" in result.content
 
 
+# -- containment (Phase 5.1) -----------------------------------------------
+#
+# Every case below was reachable before Phase 5.1: `run_command` checked
+# `argv[0]` and inspected no argument, so the confinement chokepoint that
+# guards the file tools never saw a shell command. These are the exact
+# reproductions that motivated the phase.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat /etc/hostname",
+        "ls /",
+        "grep -r secret /home",
+        "cat ../secret.txt",
+        "cat ../../etc/passwd",
+        "diff src/auth.py /etc/hostname",
+        "find .. -name secret.txt",
+        "wc -l /etc/hostname",
+    ],
+)
+def test_arguments_outside_the_workspace_are_refused(
+    shell: ShellTool, command: str
+) -> None:
+    result = shell.run_command(RunCommandInput(command=command))
+    assert result.is_error, f"{command!r} was allowed to leave the workspace"
+    assert result.misuse
+    assert "workspace" in result.content
+
+
+def test_a_symlink_out_of_the_workspace_is_refused(ws: Workspace) -> None:
+    """The same containment check covers symlinks, traversal, and both at
+    once — `resolve()` follows links before comparing (workspace.py)."""
+    (ws.root / "escape").symlink_to(ws.root.parent / "secret.txt")
+    result = ShellTool(ws).run_command(RunCommandInput(command="cat ./escape"))
+    assert result.is_error
+    assert "outside the workspace" in result.content
+
+
+def test_the_host_file_is_never_read(shell: ShellTool) -> None:
+    """The refusal must be containment, not a command that merely failed."""
+    result = shell.run_command(RunCommandInput(command="cat /etc/hostname"))
+    assert result.is_error
+    assert "exit code" not in result.content, "the command was actually executed"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls -la",
+        "grep -rn TODO .",
+        "cat src/auth.py",
+        "wc -l src/auth.py README.md",
+        "find . -name '*.py'",
+        "grep --include=*.py TODO src",
+        "diff src/auth.py README.md",
+    ],
+)
+def test_ordinary_relative_commands_still_work(
+    shell: ShellTool, command: str
+) -> None:
+    """Containment that rejects normal usage would just be an outage: the
+    agent cannot do its job and burns its budget being told no."""
+    result = shell.run_command(RunCommandInput(command=command))
+    assert not result.misuse, f"{command!r} was wrongly refused: {result.content}"
+
+
+def test_interpreters_need_a_sandbox(ws: Workspace) -> None:
+    """`python -c` runs anything, so an allowlist containing it was never a
+    boundary. Without isolation it is not offered at all."""
+    shell = ShellTool(ws, sandbox=None)
+    result = shell.run_command(RunCommandInput(command='python3 -c "print(1)"'))
+    assert result.is_error
+    assert "needs the sandbox" in result.content
+
+
+def test_the_python_c_escape_is_closed(ws: Workspace) -> None:
+    """The original reproduction: an interpreter writing outside the
+    workspace, past a confinement check that only ever saw argv[0]."""
+    target = ws.root.parent / "ESCAPED.txt"
+    shell = ShellTool(ws, sandbox=None)
+    result = shell.run_command(
+        RunCommandInput(command=f"python3 -c \"open('{target}','w').write('x')\"")
+    )
+    assert result.is_error
+    assert not target.exists(), "an agent wrote outside the workspace"
+
+
 def test_nonzero_exit_is_a_result_not_a_tool_error(shell: ShellTool) -> None:
     """A failing test suite is information the agent must reason about."""
     result = shell.run_command(RunCommandInput(command="ls definitely-not-here"))

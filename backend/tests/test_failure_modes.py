@@ -24,7 +24,7 @@ from app.agents.personas import CODER, PM
 from app.config import Settings, get_settings
 from app.llm.base import LLMError, RateLimited
 from app.llm.fake import FakeProvider, Turn, calls_tool
-from app.protocol.events import AgentStatus, AlertKind, RunPhase
+from app.protocol.events import AgentStatus, AlertKind, AlertSeverity, RunPhase
 from app.transport.session import Session
 from app.world.state import LockConflict
 from app.world.tilemap import load_tilemap
@@ -251,6 +251,59 @@ async def test_exhausted_retries_escalate_rather_than_hang(
     assert session.world.alerts[alert_id].severity.value == "escalation"
 
 
+# -- degraded isolation ----------------------------------------------------
+
+
+def _unsandboxed(tmp_path: Path) -> Session:
+    root = tmp_path / "workspace"
+    root.mkdir(parents=True, exist_ok=True)
+    settings = get_settings().model_copy(
+        update={"workspace_root": root, "sandbox": "off"}
+    )
+    tilemap = load_tilemap(MAP_PATH / "office_v1.json", "office_v1")
+    return Session(
+        "sesn_unsandboxed",
+        tilemap,
+        settings,
+        FakeProvider(),
+        checkpointer=InMemorySaver(),
+    )
+
+
+async def test_running_without_isolation_raises_a_standing_banner(
+    tmp_path: Path,
+) -> None:
+    """A weakened security posture has to be visible in the office, not just
+    in a log line the operator is not reading. Same reasoning as every other
+    agent state: something nobody can see is something nobody accounts for.
+    """
+    session = _unsandboxed(tmp_path)
+    alert = session.world.alerts["sandbox-degraded"]
+
+    assert alert.severity is AlertSeverity.WARNING, "must not block the office"
+    assert alert.actions == [], "nothing here for the operator to decide"
+    assert "without isolation" in alert.message
+
+
+async def test_the_banner_is_in_the_opening_snapshot(tmp_path: Path) -> None:
+    """Raised in the constructor, so it is already there for the first client
+    rather than only for one that happened to be watching."""
+    session = _unsandboxed(tmp_path)
+    ids = [a.alert_id for a in session.world.snapshot().data.alerts]
+    assert "sandbox-degraded" in ids
+
+
+async def test_unsandboxed_agents_lose_the_executing_tools(
+    tmp_path: Path,
+) -> None:
+    """The banner is not merely advisory — the capability really is gone."""
+    session = _unsandboxed(tmp_path)
+    shell = session.bench.toolboxes[CODER.agent_id].shell
+    assert shell.sandbox is None
+    assert "python3" not in shell.allowlist
+    assert "cat" in shell.allowlist
+
+
 # -- mode 3: lock contention -----------------------------------------------
 
 
@@ -401,7 +454,10 @@ async def test_cancelling_a_suspended_run_tears_the_escalation_down(
     await session.cancel_run()
 
     assert session.world.run.phase is RunPhase.IDLE
-    assert session.world.alerts == {}
+    # Named specifically rather than asserting the alert map is empty: a host
+    # without bubblewrap carries a standing `sandbox-degraded` banner that has
+    # nothing to do with this run and must survive cancelling it.
+    assert alert_id not in session.world.alerts
     assert all(
         a.status is not AgentStatus.ESCALATED for a in session.world.agents.values()
     )

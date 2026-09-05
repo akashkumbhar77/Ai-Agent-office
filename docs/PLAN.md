@@ -326,9 +326,9 @@ file operation to be confined. A shell `cat` is a file operation.
 `CLAUDE.md` §8 rejects blocklists for exactly the reason they fail here — the
 next interpreter flag nobody thought of.
 
-**Degradation must be visible, not silent.** `SANDBOX=auto` uses docker or
-podman if present. With no runtime available the allowlist drops to the inert
-set only, and the office raises a standing `warning` alert saying so. Running
+**Degradation must be visible, not silent.** `SANDBOX=auto` uses bubblewrap if
+present. With no runtime available the allowlist drops to the inert set only,
+and the office raises a standing `warning` alert saying so. Running
 `SANDBOX=off` is permitted — this is a local dev tool — but it too raises the
 banner. A tool whose product is visibility must not hide its own weakened
 state.
@@ -337,6 +337,47 @@ state.
 symlink out, `python -c` write, `npx`, `git push` — each rejected or contained,
 with the reproduction above as a regression test. Sandbox-off shows the banner.
 The false comment is gone.
+
+**Status: complete.** Findings, in the order they cost time:
+
+- **Bubblewrap rather than Docker.** Unprivileged, so the backend needs no
+  daemon socket and no group that is equivalent to root; and fast enough that
+  the whole sandbox suite runs in under a second, which matters when an agent
+  runs a test suite thirty times in a run. Docker would also have meant
+  building and shipping an image, a deployment story this project does not
+  have.
+- **The allowlist has to follow the isolation.** Keeping interpreters on it
+  when no sandbox is running would leave the original hole open under a new
+  name, so it splits: `INERT_ALLOWLIST` unsandboxed, everything unsandboxed
+  plus the runners when contained. `ShellTool` derives the default from
+  whether it was given a sandbox, so the two cannot drift apart in a
+  deployment.
+- **A workspace venv could not run, and the live run is what showed it.** The
+  venv is inside the workspace and therefore bound, but `bin/python3` is a
+  symlink to the interpreter it was built from — anaconda here, commonly
+  pyenv or uv — which lives outside `/usr`. Every script in the venv then
+  fails `execvp` with ENOENT despite being plainly present, because the
+  shebang cannot resolve. `_toolchain_prefixes()` reads `pyvenv.cfg` and
+  binds that base prefix read-only, with a guard that refuses to bind a home
+  directory: the widening is to the toolchain the project declares, not to
+  everything near it.
+- **`PATH` had to include the project's own tools.** `.venv/bin` and
+  `node_modules/.bin` are inside the workspace and were already bound; only
+  PATH was missing. Without it an agent asked to "verify by running the
+  tests" could not.
+- **bwrap's own error is unusable by an agent.**
+  `bwrap: execvp pytest: No such file or directory` names an internal detail
+  and suggests nothing, so the agent retries the identical call until its
+  budget is gone. It is now translated into what is actually available and
+  what to try instead.
+- **`--clearenv` matters more than it looks.** The backend runs with the
+  provider API key in its environment. Inheriting it would hand every agent
+  the key, and the sandbox's closed network would be the only thing between
+  that and exfiltration. There is now a test asserting the key is absent.
+- **A live-run assertion had been passing vacuously since Phase 4.** The
+  files-tab check matched the objective text echoed in the prompt bar, which
+  names the same file, so it went green the moment the run started. Scoped to
+  the inspector.
 
 #### 5.2 A cost ceiling
 
