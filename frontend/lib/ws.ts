@@ -68,9 +68,12 @@ export class FableSocket {
     this.ws = null;
   }
 
-  send(...messages: ClientMessage[]): void {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
+  /** Returns false when the socket is not open, so callers can tell the
+   *  operator their click went nowhere instead of silently dropping it. */
+  send(...messages: ClientMessage[]): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;
     this.ws.send(JSON.stringify(clientFrame(...messages)));
+    return true;
   }
 
   private scheduleReconnect(): void {

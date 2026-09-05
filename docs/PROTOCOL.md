@@ -1,4 +1,4 @@
-# Project Fable — Wire Protocol v2
+# Project Fable — Wire Protocol v3
 
 **This document is the source of truth for the WebSocket contract.** `backend/app/protocol/` and `frontend/lib/protocol.ts` are mirrors of it. A protocol change lands in all three places in one commit, or it does not land.
 
@@ -84,7 +84,8 @@ Full authoritative state. Sent on connect and in response to a resync. Replaces 
     "agents": { "coder-1": { /* AgentState, §5.1 */ } },
     "tasks":  { "task-3":  { /* Task, §5.2 */ } },
     "tile_claims": [ { "tile": [12, 3], "agent_id": "coder-1" } ],
-    "alerts": [ /* Alert, §5.4 */ ]
+    "alerts": [ /* Alert, §5.4 */ ],
+    "run": { /* RunStatus, §5.5 */ }
   }
 }
 ```
@@ -224,6 +225,25 @@ Sent on task creation and on every state transition.
 
 `escalation` is the only severity that blocks. Its `actions` array is non-empty and lists the choices the operator has, each `{ "id": string, "label": string }` — the client renders one button per entry and sends the chosen `id` back in `escalation.resolve`. Every other severity renders as a non-blocking banner and clears on `alert.clear` with the matching `alert_id`.
 
+Every alert the server raises is eventually cleared. An escalation clears when the operator resolves it; a `rate_limit` or `provider_error` warning clears when the call that provoked it succeeds. An alert that is never cleared is a bug — a stale banner teaches the operator to ignore the banner area, which is the one place a real escalation has to be seen.
+
+Rate-limit alerts use the stable `alert_id` `rate-limit-{agent_id}`, not a fresh one per retry. Backoff can fire several times inside one model call, and a new alert per attempt would stack banners for a single condition.
+
+### 4.10 `run.status`
+
+```json
+{ "type": "run.status",
+  "data": { "phase": "awaiting_operator",
+            "objective": "Add rate limiting to the auth endpoints",
+            "alert_id": "alert-7" } }
+```
+
+The run lifecycle, sent whenever it changes. `phase` ∈ `idle` | `running` | `awaiting_operator`.
+
+This exists because the client cannot derive the run's phase from agent statuses. An escalated run and a finished one both leave every sprite parked; only the server knows whether the graph is suspended at an interrupt waiting for a decision. The client uses `phase` to decide whether `prompt.submit` will be accepted, so the operator is not invited to start a run that will be refused.
+
+`alert_id` is non-null exactly when `phase` is `awaiting_operator`, and names the escalation alert whose resolution will resume the graph.
+
 ---
 
 ## 5. Shared object shapes
@@ -279,6 +299,14 @@ Four integer fields, named exactly as the Anthropic `usage` object: `input_token
   "raised_at": "2026-09-04T09:31:02.000Z" }
 ```
 
+### 5.5 `RunStatus`
+
+```json
+{ "phase": "running", "objective": "Add rate limiting", "alert_id": null }
+```
+
+`objective` is the operator text that started the current run, retained while `phase` is `running` or `awaiting_operator` so a client connecting mid-run can show what the office is working on. It is `null` when `phase` is `idle`.
+
 ---
 
 ## 6. Client → server messages
@@ -291,25 +319,41 @@ Same envelope, but `seq` is always `0` and ignored by the server — the client 
 { "type": "prompt.submit", "data": { "text": "Add rate limiting to the auth endpoints" } }
 ```
 
-Accepted when the session is idle or running. The PM node picks it up; a prompt submitted mid-run is queued as a new epic, not merged into the running one.
+Accepted only when `run.status.phase` is `idle`. A prompt arriving while a run is `running` or `awaiting_operator` is refused and logged, not queued: two concurrent runs would put two agents on the same desks and the same files. The client keeps the operator out of that state by disabling submission unless `phase` is `idle`, so the refusal path only covers the race.
+
+This is the **only** way to start a run. There is no REST equivalent; a second entry point would be a second place for the busy check to drift.
 
 ### 6.2 `escalation.resolve`
 
 ```json
 { "type": "escalation.resolve",
-  "data": { "alert_id": "alert-7", "action_id": "redirect",
+  "data": { "alert_id": "alert-7", "action_id": "retry",
             "note": "Skip the Redis backend, use in-memory for now" } }
 ```
 
-`action_id` must be one of the `actions` on the raised alert; anything else is rejected with a `world.desync`. `note` is optional and is injected into the resumed graph state as operator guidance.
+Resumes a graph suspended at an escalation interrupt. `alert_id` must match the `run.status.alert_id` the server last published; a mismatch is ignored, because it means the operator clicked a button rendered from a stale alert.
 
-### 6.3 `session.pause` / `session.resume`
+`action_id` must be one of the `actions` on the raised alert:
+
+| `action_id` | Effect |
+|---|---|
+| `retry` | Re-run the node that escalated. The task returns to `in_progress`. |
+| `skip` | Abandon this task, keep the run. The task stays `escalated`; the run advances to the next one. Not offered when the escalation came from planning, where there is no task to skip. |
+| `abort` | End the run. Remaining tasks are left where they are. |
+
+`note` is optional. On `retry` it is prepended to the coder's feedback, so an operator can redirect the attempt rather than only repeat it — that is what makes `retry` more than a retry button.
+
+Resolution always emits `alert.clear` for the alert, and a `run.status` moving the phase off `awaiting_operator`.
+
+### 6.3 `run.cancel`
 
 ```json
-{ "type": "session.pause", "data": {} }
+{ "type": "run.cancel", "data": {} }
 ```
 
-Pause takes effect at the next graph node boundary, not mid-model-call. There is no dedicated pause acknowledgement event: the server confirms by transitioning every active agent to `idle` via `agent.status`, and that observable state change *is* the confirmation. A client showing a "pausing…" spinner clears it when the last active agent reaches `idle`.
+Cancels the in-flight run, including one suspended at an escalation. There is no dedicated acknowledgement event: the server confirms with a `run.status` of `idle`, and that state change *is* the confirmation.
+
+Cancellation is not a pause — nothing resumes afterwards. It was previously spelled `session.pause` with an unimplemented `session.resume` beside it; the pair described a capability the server did not have.
 
 ---
 
@@ -343,6 +387,14 @@ Additive changes — a new event type, a new optional field, a new enum value �
 ---
 
 ## 9. Changelog
+
+**v3** — replaced `session.pause` / `session.resume` with `run.cancel`, and
+added `run.status` (§4.10) plus `WorldSnapshotData.run`. The pause/resume pair
+named a capability that did not exist: `session.pause` cancelled the run
+outright and `session.resume` had a handler that did nothing, so a client
+following the document would have believed a cancelled run could be brought
+back. Removing two client messages is breaking under §8. `run.status` is
+additive but ships in the same bump.
 
 **v2** — removed `WorldSnapshotData.file_locks` and `AgentState.retry_count`.
 Both were emitted on every frame and read by nothing: no agent ever took a

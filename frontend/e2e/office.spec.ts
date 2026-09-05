@@ -93,6 +93,14 @@ async function waitForReady(page: Page) {
 test.describe("Phase 1 acceptance", () => {
   let consoleErrors: string[];
 
+  // The world is long-lived and shared across spec files, so "the agents are
+  // at their seeded desks" is only true if nothing has run yet. Reset makes
+  // that a precondition this file establishes rather than one it inherits
+  // from whichever spec happened to run first.
+  test.beforeAll(async ({ request }) => {
+    await request.post(`${API}/debug/reset`, { data: {} });
+  });
+
   test.beforeEach(async ({ page }) => {
     consoleErrors = [];
     page.on("console", (msg) => {

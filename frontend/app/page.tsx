@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   Alerts,
@@ -9,9 +9,9 @@ import {
   PromptBar,
   WorkerTray,
 } from "@/components/CommandCenter";
-import type { Tile } from "@/lib/protocol";
+import type { ClientMessage, Tile } from "@/lib/protocol";
 import { useFableStore } from "@/lib/store";
-import { API_BASE } from "@/lib/ws";
+import { API_BASE, FableSocket } from "@/lib/ws";
 
 // Phaser reads `window` at import time — it must never be evaluated on the
 // server (CLAUDE.md §6).
@@ -32,6 +32,25 @@ export default function Home() {
 
   const [selected, setSelected] = useState<string | null>("coder-1");
   const [note, setNote] = useState<string | null>(null);
+
+  // The socket lives here, not in the canvas: it carries prompts and
+  // escalation decisions as well as world events, so its lifetime is the
+  // page's rather than the renderer's.
+  const socketRef = useRef<FableSocket | null>(null);
+  useEffect(() => {
+    const socket = new FableSocket(SESSION_ID);
+    socketRef.current = socket;
+    socket.connect();
+    return () => {
+      socket.close();
+      socketRef.current = null;
+    };
+  }, []);
+
+  const send = useCallback(
+    (...messages: ClientMessage[]) => socketRef.current?.send(...messages) ?? false,
+    [],
+  );
 
   // Clicking a tile still drives the debug mover. It is how you check the
   // simulation independently of the agents (PLAN.md Phase 1 harness).
@@ -84,8 +103,8 @@ export default function Home() {
         </span>
       </header>
 
-      <PromptBar sessionId={SESSION_ID} />
-      <Alerts />
+      <PromptBar send={send} />
+      <Alerts send={send} />
 
       {desync && (
         <div className="rounded border border-amber-800 bg-amber-950/40 px-3 py-2 text-xs text-amber-300">
@@ -100,7 +119,7 @@ export default function Home() {
 
       <div className="flex flex-col gap-3 xl:flex-row">
         <div className="xl:flex-1">
-          <OfficeCanvas sessionId={SESSION_ID} onTileClick={handleTileClick} />
+          <OfficeCanvas onTileClick={handleTileClick} />
         </div>
 
         <aside className="flex w-full shrink-0 flex-col gap-2 xl:w-64">

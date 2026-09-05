@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     max_steps_per_subtask: int = 10
     max_tool_retries: int = 3
 
+    # --- Graph persistence -------------------------------------------------
+    # Where LangGraph checkpoints live. Required, not optional: an escalation
+    # suspends the graph on an interrupt, and an interrupt without a
+    # checkpointer raises at runtime rather than at startup.
+    checkpoint_db: Path = Path("var/checkpoints.sqlite")
+
     # --- Transport ---------------------------------------------------------
     tick_interval_ms: int = 100
     host: str = "127.0.0.1"
@@ -48,6 +54,13 @@ class Settings(BaseSettings):
         resolved = v.expanduser().resolve()
         if not resolved.is_dir():
             raise ValueError(f"WORKSPACE_ROOT is not a directory: {resolved}")
+        return resolved
+
+    @field_validator("checkpoint_db")
+    @classmethod
+    def _prepare_checkpoint_dir(cls, v: Path) -> Path:
+        resolved = v.expanduser().resolve()
+        resolved.parent.mkdir(parents=True, exist_ok=True)
         return resolved
 
     @model_validator(mode="after")

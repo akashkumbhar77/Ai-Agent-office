@@ -6,12 +6,21 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
 *.db
+
+# LangGraph checkpoints (SQLite, plus its WAL sidecars)
+backend/var/
 
 # Node
 node_modules/
 .next/
 out/
+
+# Playwright
+test-results/
+playwright-report/
 
 # Secrets & local config
 .env

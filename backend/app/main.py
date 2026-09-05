@@ -9,6 +9,7 @@ from pathlib import Path
 import structlog
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import Settings, get_settings
@@ -54,17 +55,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         utility=settings.utility_model,
     )
 
-    session = Session(DEFAULT_SESSION, tilemap, settings, provider)
-    session.start()
-    sessions[DEFAULT_SESSION] = session
-    log.info("session_started", session_id=DEFAULT_SESSION)
+    # Async, not the sync SqliteSaver: every graph node is a coroutine, and
+    # the sync saver raises at runtime rather than at import when one is.
+    # The saver is a context manager, so it is held open for the app's life —
+    # closing it would drop the checkpoints an escalation resumes from.
+    async with AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_db)) as saver:
+        log.info("checkpointer_ready", path=str(settings.checkpoint_db))
 
-    try:
-        yield
-    finally:
-        for s in sessions.values():
-            await s.stop()
-        sessions.clear()
+        session = Session(
+            DEFAULT_SESSION, tilemap, settings, provider, checkpointer=saver
+        )
+        session.start()
+        sessions[DEFAULT_SESSION] = session
+        log.info("session_started", session_id=DEFAULT_SESSION)
+
+        try:
+            yield
+        finally:
+            for s in sessions.values():
+                await s.stop()
+            sessions.clear()
 
 
 app = FastAPI(title="Project Fable", version="0.1.0", lifespan=lifespan)
@@ -137,18 +147,27 @@ async def debug_move(req: DebugMoveRequest) -> dict[str, object]:
     return {"ok": True, "seq": session.world.seq}
 
 
-class PromptRequest(BaseModel):
-    text: str = Field(min_length=1)
+class DebugResetRequest(BaseModel):
     session_id: str = DEFAULT_SESSION
 
 
-@app.post("/prompt")
-async def submit_prompt(req: PromptRequest) -> dict[str, object]:
-    """Start an agent run. The same path prompt.submit takes over the socket."""
+@app.post("/debug/reset")
+async def debug_reset(req: DebugResetRequest) -> dict[str, object]:
+    """Return the office to its seeded state.
+
+    The world is long-lived and mutable, so an acceptance test asserting on
+    seeded desks depends on whatever ran before it. This is the harness that
+    removes that coupling; it cancels any run in flight.
+    """
     session = require_session(req.session_id)
-    if not session.submit(req.text):
-        raise HTTPException(status_code=409, detail="a run is already in flight")
-    return {"ok": True, "objective": req.text}
+    await session.reset()
+    return {"ok": True, "seq": session.world.seq}
+
+
+# Runs start over the socket only (PROTOCOL.md §6.1). There was a POST /prompt
+# beside it doing the same thing; two entry points meant two places for the
+# busy check to drift, and the socket has to exist anyway for
+# escalation.resolve.
 
 
 @app.websocket("/ws/{session_id}")

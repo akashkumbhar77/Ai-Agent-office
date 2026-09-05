@@ -1,12 +1,12 @@
 /**
- * Wire protocol v2 — mirror of docs/PROTOCOL.md.
+ * Wire protocol v3 — mirror of docs/PROTOCOL.md.
  *
  * This file is one of three places the protocol lives; the others are
  * docs/PROTOCOL.md (source of truth) and backend/app/protocol/events.py.
  * A change to one is a change to all three, in the same commit.
  */
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 export type Tile = [number, number];
 
@@ -33,6 +33,8 @@ export type TaskState =
   | "in_review"
   | "done"
   | "escalated";
+
+export type RunPhase = "idle" | "running" | "awaiting_operator";
 
 export type LogStream = "stdout" | "stderr" | "thinking" | "tool";
 export type FileOp = "create" | "edit" | "delete";
@@ -123,6 +125,20 @@ export interface Alert {
   raised_at: string;
 }
 
+/**
+ * The run lifecycle (PROTOCOL.md §5.5).
+ *
+ * Not derivable from agent statuses: an escalated run and a finished one both
+ * leave every sprite parked. Only the server knows whether the graph is
+ * suspended at an interrupt waiting for a decision.
+ */
+export interface RunStatus {
+  phase: RunPhase;
+  objective: string | null;
+  /** Non-null exactly when `phase` is "awaiting_operator". */
+  alert_id: string | null;
+}
+
 /** An array entry, not a map key — JSON object keys cannot be tuples. */
 export interface TileClaim {
   tile: Tile;
@@ -141,6 +157,7 @@ export interface WorldSnapshotData {
   tasks: Record<string, Task>;
   tile_claims: TileClaim[];
   alerts: Alert[];
+  run: RunStatus;
 }
 
 export interface AgentMoveData {
@@ -160,6 +177,7 @@ export interface AgentUsageData extends TokenUsage {
 export type ServerEvent =
   | { type: "world.snapshot"; data: WorldSnapshotData }
   | { type: "world.desync"; data: { reason: string } }
+  | { type: "run.status"; data: RunStatus }
   | {
       type: "agent.spawn";
       data: { agent_id: string; persona: Persona; display_name: string; tile: Tile };
@@ -202,13 +220,14 @@ export type ServerEventType = ServerEvent["type"];
 // ---------------------------------------------------------------------------
 
 export type ClientMessage =
+  /** The only way to start a run — there is no REST equivalent (§6.1). */
   | { type: "prompt.submit"; data: { text: string } }
   | {
       type: "escalation.resolve";
-      data: { alert_id: string; action_id: string; note?: string };
+      data: { alert_id: string; action_id: string; note?: string | null };
     }
-  | { type: "session.pause"; data: Record<string, never> }
-  | { type: "session.resume"; data: Record<string, never> };
+  /** Cancel, not pause: nothing resumes afterwards (§6.3). */
+  | { type: "run.cancel"; data: Record<string, never> };
 
 // ---------------------------------------------------------------------------
 // Frame envelope (PROTOCOL.md §2)

@@ -106,16 +106,17 @@ Agent systems fail in specific ways. Each of these has a defined behavior; do no
 | Failure | Backend behavior | Visible behavior |
 |---|---|---|
 | Invalid tool call / malformed output | Pydantic catches it; inject a correction message into agent memory; retry | Sprite enters `confused` state, thought bubble shows the error |
-| Rate limit (429) or local queue backlog | Exponential backoff with jitter, capped; do not drop the task | Sprite walks to breakroom, `idle_waiting` state; amber non-blocking banner |
-| Two agents target one file or one desk tile | Mutex on the file path; occupancy claim on the tile; loser re-paths | Second sprite steers around and waits |
+| Rate limit (429) or local queue backlog | Exponential backoff with jitter, capped; do not drop the task | Sprite enters `waiting`; amber non-blocking banner with a recovery ETA, cleared when the call succeeds |
+| Two agents target one desk tile | Occupancy claim on the tile, transferred at move *start*; loser re-paths | Second sprite enters `blocked` and stays put, bubble naming the holder |
 | Client disconnects | Session survives in the store; sequence numbers keep advancing | Client reconnects with backoff, pulls `GET /world/snapshot`, resumes without resetting the workflow |
-| Reviewer/coder ping-pong | `max_steps` per sub-task enforced in the graph; circuit breaker trips | Workflow pauses, escalation icon, banner prompts human decision |
+| Reviewer/coder ping-pong | `max_steps` per sub-task enforced in the graph; circuit breaker trips | Workflow suspends on a graph interrupt, escalation banner offers retry / skip / abort |
 
 Rules that follow from this table:
 
 - **Never silently swallow an agent error.** It becomes an event on the wire and a visible sprite state, or it does not exist.
 - **Every loop has a bound.** Graph recursion, retry counts, and reconnection attempts all have explicit caps. An unbounded `while` in agent control flow is a bug.
-- **Escalation is a first-class outcome**, not a failure. A paused workflow awaiting human input is a supported terminal state of any sub-task.
+- **Escalation is a first-class outcome**, not a failure. A workflow suspended on a graph interrupt awaiting human input is a supported resting state of any sub-task — the checkpoint stays live, so resolving it resumes the same run rather than starting a new one.
+- **Every alert is eventually cleared.** An escalation clears when the operator resolves it; a throttling warning clears when the call succeeds *or* when the retries run out. A banner that outlives its condition teaches the operator to ignore the banner area, which is the one place a real escalation has to be seen.
 
 ---
 
@@ -172,11 +173,16 @@ cd backend && uv run python ../scripts/smoke_provider.py
 Debug harness (Phase 1, retained as the Phase 4 fault-injection entry point):
 
 ```bash
-curl -s localhost:8000/world/map | jq          # desks, rooms, dimensions
+curl -s localhost:8000/world/snapshot | jq     # agents, tasks, alerts, run phase
 curl -s -XPOST localhost:8000/debug/move \
   -H 'content-type: application/json' \
   -d '{"agent_id":"coder-1","to":[24,16],"duration_ms":3000}'
+# Back to seeded desks; cancels any run in flight.
+curl -s -XPOST localhost:8000/debug/reset -H 'content-type: application/json' -d '{}'
 ```
+
+Runs start over the WebSocket only (`prompt.submit`). There is no REST
+equivalent — two entry points meant two places for the busy check to drift.
 
 In the browser, clicking a tile issues the same call for the selected agent.
 

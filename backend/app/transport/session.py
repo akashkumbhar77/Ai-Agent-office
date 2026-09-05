@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from fastapi import WebSocket
+from langgraph.types import Command
 
 from app.agents.personas import ROSTER
 from app.agents.toolbox import Toolbox
@@ -17,6 +20,7 @@ from app.llm.base import LLMProvider
 from app.protocol.events import (
     AgentStatus,
     ClientFrame,
+    RunPhase,
     ServerEvent,
     ServerFrame,
     Tile,
@@ -51,6 +55,13 @@ class Session:
         self._arrivals: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
         self._run: asyncio.Task[None] | None = None
+        # A fresh checkpoint thread per run. Reusing one would merge a
+        # finished run's channel state into the next objective's.
+        self._thread_id: str | None = None
+        self._objective: str | None = None
+        # The alert whose resolution resumes a suspended graph. Non-None is
+        # what makes the session busy without a task in flight.
+        self._awaiting: str | None = None
 
         self._seed_agents()
 
@@ -189,18 +200,30 @@ class Session:
         for message in frame.events:
             log.info("client_message", session_id=self.session_id, type=message.type)
 
-            if message.type == "prompt.submit":
-                self.submit(message.data.text)
-            elif message.type == "session.pause":
-                self.cancel_run()
-            # session.resume restarts from a checkpoint and escalation.resolve
-            # becomes a graph interrupt — both land in Phase 4.
+            match message.type:
+                case "prompt.submit":
+                    self.submit(message.data.text)
+                case "escalation.resolve":
+                    self.resolve_escalation(
+                        message.data.alert_id,
+                        message.data.action_id,
+                        message.data.note,
+                    )
+                case "run.cancel":
+                    await self.cancel_run()
 
     # -- agent runs --------------------------------------------------------
 
     @property
     def busy(self) -> bool:
-        return self._run is not None and not self._run.done()
+        """True while a run owns the office.
+
+        A graph suspended at an escalation counts: the task has returned, but
+        the checkpoint is live and the agents are parked mid-run. Reading only
+        the task would let a second objective start on top of the first.
+        """
+        in_flight = self._run is not None and not self._run.done()
+        return in_flight or self._awaiting is not None
 
     def submit(self, objective: str) -> bool:
         """Start a run for an operator objective.
@@ -212,30 +235,138 @@ class Session:
         if self.busy:
             log.warning("run_rejected_busy", session_id=self.session_id)
             return False
-        self._run = asyncio.create_task(self._execute(objective))
+        self._thread_id = f"{self.session_id}-{uuid.uuid4().hex[:8]}"
+        self._objective = objective
+        self.world.set_run(RunPhase.RUNNING, objective=objective)
+        self._run = asyncio.create_task(self._drive({"objective": objective}))
         return True
 
-    def cancel_run(self) -> None:
+    def resolve_escalation(
+        self, alert_id: str, action_id: str, note: str | None = None
+    ) -> bool:
+        """Resume a suspended graph with the operator's decision.
+
+        Both identifiers are checked against live state rather than trusted.
+        A stale `alert_id` means the operator clicked a button rendered from
+        an alert the server has already moved past, and an `action_id` that
+        was never offered means the client invented one; either way the answer
+        does not describe the decision the graph is actually waiting on.
+        """
+        if self._awaiting is None or alert_id != self._awaiting:
+            log.warning(
+                "escalation_resolve_stale",
+                session_id=self.session_id,
+                alert_id=alert_id,
+                awaiting=self._awaiting,
+            )
+            return False
+
+        alert = self.world.alerts.get(alert_id)
+        if alert is None or action_id not in {a.id for a in alert.actions}:
+            log.warning(
+                "escalation_resolve_rejected",
+                session_id=self.session_id,
+                alert_id=alert_id,
+                action_id=action_id,
+            )
+            return False
+
+        self._awaiting = None
+        self.world.set_run(RunPhase.RUNNING, objective=self._objective)
+        self._run = asyncio.create_task(
+            self._drive(Command(resume={"action_id": action_id, "note": note}))
+        )
+        return True
+
+    async def reset(self) -> None:
+        """Return the office to its seeded state.
+
+        Debug harness only, and the counterpart to `/debug/move`: the world is
+        long-lived and mutable, so an acceptance test that asserts on seeded
+        positions is otherwise at the mercy of whatever ran before it.
+        """
+        await self.cancel_run()
+        for task in self._arrivals.values():
+            task.cancel()
+        self._arrivals.clear()
+
+        async with self._lock:
+            self.world.agents.clear()
+            self.world.tasks.clear()
+            self.world.alerts.clear()
+            self.world.tile_claims.clear()
+            self._seed_agents()
+            self.world.set_run(RunPhase.IDLE)
+            self.world.publish_snapshot()
+        await self.flush()
+        log.info("session_reset", session_id=self.session_id)
+
+    async def join_run(self) -> None:
+        """Wait until the graph stops advancing.
+
+        Returns when the run finishes *or* suspends on an escalation — a
+        suspended run is stopped as far as the event loop is concerned, and
+        the thing that restarts it is an operator, not time.
+        """
+        run = self._run
+        if run is None:
+            return
+        with contextlib.suppress(asyncio.CancelledError):
+            await run
+
+    async def cancel_run(self) -> None:
+        """Abandon the run, whether it is executing or suspended.
+
+        A suspended run has no task to cancel — the graph is parked in a
+        checkpoint — so the escalation is torn down here instead. Dropping the
+        thread id is what makes it unresumable.
+        """
         if self._run is not None and not self._run.done():
             self._run.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._run
 
-    async def _execute(self, objective: str) -> None:
+        async with self._lock:
+            if self._awaiting is not None:
+                self.world.clear_alert(self._awaiting)
+                self._awaiting = None
+            for agent in list(self.world.agents.values()):
+                if agent.status is AgentStatus.ESCALATED:
+                    self.world.set_status(agent.id, AgentStatus.IDLE, None)
+            self._thread_id = None
+            self._objective = None
+            self.world.set_run(RunPhase.IDLE)
+        await self.flush()
+
+    async def _drive(self, payload: Any) -> None:
+        """Run the graph until it finishes or suspends.
+
+        `payload` is either the initial state for a new run or a Command
+        carrying an operator decision into a suspended one. Both go through
+        the same call because from here they are the same operation: advance
+        the graph on this thread and report where it stopped.
+        """
         # The graph is cyclic (coder <-> reviewer). LangGraph's default
         # recursion limit of 25 counts node visits, so a handful of tasks
         # with rework would abort mid-run. Budget generously: the real
         # bound on looping is the step_count breaker, not this.
         config = {
-            "configurable": {"thread_id": f"{self.session_id}-run"},
+            "configurable": {"thread_id": self._thread_id},
             "recursion_limit": 200,
         }
         try:
-            result = await self.workflow.ainvoke({"objective": objective}, config=config)
-            log.info(
-                "run_finished",
-                session_id=self.session_id,
-                completed=len(result.get("completed") or []),
-                failure=result.get("failure"),
-            )
+            result = await self.workflow.ainvoke(payload, config=config)
+            interrupts = result.get("__interrupt__") or ()
+            if interrupts:
+                self._suspend(interrupts[0])
+            else:
+                log.info(
+                    "run_finished",
+                    session_id=self.session_id,
+                    completed=len(result.get("completed") or []),
+                    failure=result.get("failure"),
+                )
+                self._finish()
         except asyncio.CancelledError:
             log.info("run_cancelled", session_id=self.session_id)
             raise
@@ -243,5 +374,30 @@ class Session:
             # A crashed run must not take the session with it; the operator
             # keeps their office and can try again.
             log.exception("run_failed", session_id=self.session_id)
+            self._finish()
         finally:
             await self.flush()
+
+    def _suspend(self, interrupt: Any) -> None:
+        """Park the session on an escalation the operator has to answer."""
+        payload = getattr(interrupt, "value", None) or {}
+        alert_id = payload.get("alert_id")
+        if not alert_id:
+            # Without an alert id there is no button to resolve it with, so
+            # the run would hang unresolvable. Treat it as a finished run.
+            log.error("interrupt_without_alert", session_id=self.session_id)
+            self._finish()
+            return
+        self._awaiting = alert_id
+        self.world.set_run(
+            RunPhase.AWAITING_OPERATOR,
+            objective=self._objective,
+            alert_id=alert_id,
+        )
+        log.info("run_suspended", session_id=self.session_id, alert_id=alert_id)
+
+    def _finish(self) -> None:
+        self._awaiting = None
+        self._thread_id = None
+        self._objective = None
+        self.world.set_run(RunPhase.IDLE)

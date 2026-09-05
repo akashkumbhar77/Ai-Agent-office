@@ -137,9 +137,11 @@ One socket, `/ws/{session_id}`. All frames are JSON with a common envelope:
 
 | Type | Purpose |
 |---|---|
-| `prompt.submit` | Operator submits a macro objective |
-| `escalation.resolve` | Operator answers a paused workflow (`approve`, `redirect`, `abort`) |
-| `session.pause` / `session.resume` | Manual control |
+| `prompt.submit` | Operator submits a macro objective. The only way to start a run |
+| `escalation.resolve` | Operator answers a suspended workflow (`retry`, `skip`, `abort`) |
+| `run.cancel` | Abandon the run, whether executing or suspended |
+
+Phase 4 replaced `session.pause` / `session.resume` with `run.cancel`: pause cancelled the run outright and resume did nothing, so the pair named a capability that did not exist. A `run.status` server event was added alongside, because the run's phase is not derivable from agent statuses — a suspended run and a finished one both leave every sprite parked.
 
 ### Batching
 
@@ -250,6 +252,26 @@ Goal: every scenario in §7 behaves as specified under deliberate fault injectio
 8. Visual polish: error expressions, dark-mode pass, banner and escalation UI.
 
 **Acceptance:** each of the five failure rows in `CLAUDE.md` §7 is reproduced by an automated test and resolves to the specified behavior, with the correct sprite state and no crashed sockets.
+
+**Status: complete**, with items 6 and 8 deliberately not done — see below.
+
+Findings, in the order they cost time:
+
+- **A LangGraph node re-executes from the top when its interrupt is resumed.** Anything before the `interrupt()` call therefore happens twice. The first draft raised the alert inside the escalation node, which produced a second alert (new uuid) on every resume. The alert is now raised by the node that escalated, and the escalation node does nothing before it suspends.
+- **An interrupted `ainvoke` returns *only* `__interrupt__`** — not the accumulated state. Any code reading `result["completed"]` after an invoke has to check for suspension first, or it reads a dict that has no such key.
+- **`interrupt()` needs a checkpointer**, and the app had never wired one: `Session` accepted one and only a test ever passed it. The lifespan now holds an `AsyncSqliteSaver` open for the app's life.
+- **A suspended run is still busy.** The task has returned, so a task-only busy check said idle while four agents sat parked mid-run and the checkpoint was live. `busy` now includes "awaiting a decision".
+- **A new checkpoint thread per run.** Reusing one thread id merges a finished run's channel state into the next objective's.
+- **Retry has to reset the breaker's counter**, or the resumed run trips it again on the first rejection and "one more round" buys nothing.
+- **Skip must not mark the task done.** It leaves the task `escalated` and advances the cursor; anything else launders an abandoned task as a success.
+- **A rate-limit alert needs a stable id.** Backoff fires several times inside one model call, and a fresh uuid per attempt stacked banners for a single condition. It is `rate-limit-{agent_id}`, and it is cleared both on recovery and on giving up — a banner promising a retry that is no longer coming is worse than no banner.
+- **The E2E specs shared a mutable world.** Adding a spec that starts runs broke the Phase 1 assertions about seeded desks, because file order decided the outcome. `POST /debug/reset` makes freshness a precondition a spec declares rather than inherits.
+- **`confused` is not observable at session level.** Statuses coalesce per tick, so a self-correction that completes inside 100 ms never reaches the wire as a status. That is by design; what the operator actually reads is the rejection in the tool log, so the session-level test asserts on that instead.
+
+Not done, and why:
+
+- **Redis-backed `WorldState` (item 6)** — the v1 topology is one process. Adding a second store with no second process is the same premature generality the Phase 3 review deleted.
+- **Visual polish (item 8)** — cosmetic, and none of it changes what the system does.
 
 ---
 

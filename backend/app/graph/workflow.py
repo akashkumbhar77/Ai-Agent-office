@@ -6,6 +6,12 @@ A cyclic LangGraph over four personas:
                         ▲       │
                         └───────┘ changes requested
 
+Any node that cannot make progress routes to `escalation`, which suspends the
+graph on a LangGraph interrupt until an operator picks retry, skip, or abort.
+That is the difference between a run that failed and a run that is waiting:
+the checkpoint is still live, so retry resumes the same run rather than
+starting a new one.
+
 The cycle is the point. Phase 2 looped over tasks *inside* the coder node,
 which left nowhere to attach a rejection edge; the graph now advances one task
 at a time, so "the reviewer sends it back" is an edge rather than a special
@@ -29,6 +35,7 @@ from typing import Annotated, Any, TypedDict
 
 import structlog
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
 from app.agents.personas import CODER, PM, REVIEWER, WRITER, PersonaSpec
 from app.agents.runtime import AgentOutcome, AgentRunner
@@ -76,6 +83,15 @@ class RunState(TypedDict, total=False):
     # Rejections for the current task, against max_steps_per_subtask.
     step_count: Annotated[int, _keep_last]
     failure: Annotated[str | None, _keep_last]
+    # Set by any node that escalates; consumed and cleared by the escalation
+    # node. Non-null is what routes into the interrupt, so it must be cleared
+    # on the way out or the resumed run re-escalates immediately.
+    escalation: Annotated[dict[str, str | None] | None, _keep_last]
+    # Which node escalated, preserved past the clear so `retry` knows where to
+    # resume. Held separately for exactly that reason.
+    escalated_from: Annotated[str | None, _keep_last]
+    # The operator's choice: retry | skip | abort.
+    decision: Annotated[str | None, _keep_last]
 
 
 @dataclass
@@ -179,13 +195,17 @@ def build_workflow(bench: Workbench, checkpointer: Any | None = None) -> Any:
 
         if not outcome.ok or not drafts:
             reason = outcome.error or "the PM produced no tasks"
-            _escalate(
-                bench,
-                spec.agent_id,
-                AlertKind.PROVIDER_ERROR if outcome.error else AlertKind.TOOL_ERROR,
-                f"Decomposition failed: {reason}",
-            )
-            return {"tasks": [], "failure": reason}
+            return {
+                "tasks": [],
+                "escalation": _escalate(
+                    bench,
+                    spec.agent_id,
+                    AlertKind.PROVIDER_ERROR if outcome.error else AlertKind.TOOL_ERROR,
+                    f"Decomposition failed: {reason}",
+                    origin="pm",
+                ),
+                "decision": None,
+            }
 
         bench.walk_to(spec, bench.desk_for(spec), "back to desk")
 
@@ -219,6 +239,8 @@ def build_workflow(bench: Workbench, checkpointer: Any | None = None) -> Any:
             "changed": [],
             "step_count": 0,
             "failure": None,
+            "escalation": None,
+            "decision": None,
         }
 
     async def coder_node(state: RunState) -> RunState:
@@ -257,14 +279,17 @@ def build_workflow(bench: Workbench, checkpointer: Any | None = None) -> Any:
             return {"changed": changed, "failure": None}
 
         bench.world.transition_task(task["task_id"], TaskState.ESCALATED)
-        _escalate(
-            bench,
-            spec.agent_id,
-            _alert_kind(outcome),
-            f"{task['title']}: {outcome.error or outcome.stopped}",
-            task_id=task["task_id"],
-        )
-        return {"failure": outcome.error or outcome.stopped}
+        return {
+            "escalation": _escalate(
+                bench,
+                spec.agent_id,
+                _alert_kind(outcome),
+                f"{task['title']}: {outcome.error or outcome.stopped}",
+                task_id=task["task_id"],
+                origin="coder",
+            ),
+            "decision": None,
+        }
 
     async def reviewer_node(state: RunState) -> RunState:
         spec = REVIEWER
@@ -308,14 +333,17 @@ def build_workflow(bench: Workbench, checkpointer: Any | None = None) -> Any:
             # approval — that would let unreviewed work through on an error.
             reason = outcome.error or "the reviewer produced no verdict"
             bench.world.transition_task(task["task_id"], TaskState.ESCALATED)
-            _escalate(
-                bench,
-                spec.agent_id,
-                _alert_kind(outcome),
-                f"Review failed: {reason}",
-                task_id=task["task_id"],
-            )
-            return {"failure": reason}
+            return {
+                "escalation": _escalate(
+                    bench,
+                    spec.agent_id,
+                    _alert_kind(outcome),
+                    f"Review failed: {reason}",
+                    task_id=task["task_id"],
+                    origin="reviewer",
+                ),
+                "decision": None,
+            }
 
         verdict = verdicts[-1]
         if verdict.approved:
@@ -375,7 +403,7 @@ def build_workflow(bench: Workbench, checkpointer: Any | None = None) -> Any:
             bench.world.transition_task(task_id, TaskState.ESCALATED)
 
         limit = bench.settings.max_steps_per_subtask
-        _escalate(
+        escalation = _escalate(
             bench,
             CODER.agent_id,
             AlertKind.LOOP_BREAKER,
@@ -384,23 +412,109 @@ def build_workflow(bench: Workbench, checkpointer: Any | None = None) -> Any:
                 f"exchanged {limit} revisions without converging"
             ),
             task_id=task_id,
+            origin="breaker",
         )
         bench.world.set_status(
             REVIEWER.agent_id, AgentStatus.ESCALATED, "needs a decision"
         )
-        return {"failure": f"loop breaker tripped after {limit} revisions"}
+        return {"escalation": escalation, "decision": None}
+
+    async def escalation_node(state: RunState) -> RunState:
+        """Suspend the run until an operator decides (PROTOCOL.md §6.2).
+
+        Nothing above the `interrupt()` call may touch the world. LangGraph
+        re-executes a node from the top when it is resumed, so a mutation
+        placed before the interrupt happens twice — the alert is therefore
+        raised by the node that escalated, and this node only consumes it.
+        """
+        esc = state.get("escalation") or {}
+        alert_id = esc.get("alert_id") or ""
+
+        answer = interrupt(
+            {
+                "alert_id": alert_id,
+                "origin": esc.get("origin"),
+                "task_id": esc.get("task_id"),
+                "message": esc.get("message"),
+            }
+        )
+
+        # --- everything below runs once, on resume -------------------------
+        decision = str((answer or {}).get("action_id") or "abort")
+        note = (answer or {}).get("note") or None
+        if decision not in ("retry", "skip", "abort"):
+            # The session validates the action against the alert before
+            # resuming, so reaching here means a caller bypassed it. Abort is
+            # the only safe reading of an unknown instruction.
+            log.warning("unknown_escalation_action", action=decision)
+            decision = "abort"
+
+        bench.world.clear_alert(alert_id)
+        # Un-park everyone the escalation stopped. The breaker parks two
+        # agents, not one, so this sweeps by status rather than by id.
+        for agent in list(bench.world.agents.values()):
+            if agent.status is AgentStatus.ESCALATED:
+                bench.world.set_status(agent.id, AgentStatus.IDLE, None)
+
+        origin = esc.get("origin")
+        task = current(state)
+        log.info(
+            "escalation_resolved", alert_id=alert_id, action=decision, origin=origin
+        )
+
+        if decision == "retry":
+            if task is not None:
+                bench.world.transition_task(task["task_id"], TaskState.IN_PROGRESS)
+            feedback = list(state.get("feedback") or [])
+            if note:
+                # Operator guidance leads: it is newer than the reviewer's and
+                # it is why the operator chose retry over abort.
+                feedback = [f"Operator instruction: {note}", *feedback]
+            return {
+                "escalation": None,
+                "escalated_from": origin,
+                "decision": "retry",
+                "failure": None,
+                "feedback": feedback,
+                # The operator asked for another round, so the breaker's
+                # count starts over rather than tripping again immediately.
+                "step_count": 0,
+            }
+
+        if decision == "skip" and task is not None:
+            # The task keeps its `escalated` state — skipping abandons it, it
+            # does not pretend it succeeded.
+            return {
+                "escalation": None,
+                "escalated_from": origin,
+                "decision": "skip",
+                "failure": None,
+                "cursor": state.get("cursor", 0) + 1,
+                "feedback": [],
+                "changed": [],
+                "step_count": 0,
+            }
+
+        return {
+            "escalation": None,
+            "escalated_from": origin,
+            "decision": "abort",
+            "failure": esc.get("message") or "operator abandoned the run",
+        }
 
     # -- edges -------------------------------------------------------------
 
     def after_pm(state: RunState) -> str:
+        if state.get("escalation"):
+            return "escalation"
         return "coder" if state.get("tasks") else END
 
     def after_coder(state: RunState) -> str:
-        return END if state.get("failure") else "reviewer"
+        return "escalation" if state.get("escalation") else "reviewer"
 
     def after_reviewer(state: RunState) -> str:
-        if state.get("failure"):
-            return END
+        if state.get("escalation"):
+            return "escalation"
         if not state.get("feedback"):
             return "writer"
         # Changes requested. The breaker is checked here, before looping back,
@@ -412,23 +526,49 @@ def build_workflow(bench: Workbench, checkpointer: Any | None = None) -> Any:
     def after_writer(state: RunState) -> str:
         return "coder" if current(state) is not None else END
 
+    def after_escalation(state: RunState) -> str:
+        match state.get("decision"):
+            case "retry":
+                # Planning failures resume at planning; everything else
+                # resumes at the coder, carrying the feedback with it.
+                return "pm" if state.get("escalated_from") == "pm" else "coder"
+            case "skip":
+                return "coder" if current(state) is not None else END
+            case _:
+                return END
+
     graph: StateGraph[RunState, None, RunState, RunState] = StateGraph(RunState)
     graph.add_node("pm", pm_node)
     graph.add_node("coder", coder_node)
     graph.add_node("reviewer", reviewer_node)
     graph.add_node("writer", writer_node)
     graph.add_node("breaker", breaker_node)
+    graph.add_node("escalation", escalation_node)
 
     graph.add_edge(START, "pm")
-    graph.add_conditional_edges("pm", after_pm, {"coder": "coder", END: END})
-    graph.add_conditional_edges("coder", after_coder, {"reviewer": "reviewer", END: END})
+    graph.add_conditional_edges(
+        "pm", after_pm, {"coder": "coder", "escalation": "escalation", END: END}
+    )
+    graph.add_conditional_edges(
+        "coder", after_coder, {"reviewer": "reviewer", "escalation": "escalation"}
+    )
     graph.add_conditional_edges(
         "reviewer",
         after_reviewer,
-        {"writer": "writer", "coder": "coder", "breaker": "breaker", END: END},
+        {
+            "writer": "writer",
+            "coder": "coder",
+            "breaker": "breaker",
+            "escalation": "escalation",
+        },
     )
     graph.add_conditional_edges("writer", after_writer, {"coder": "coder", END: END})
-    graph.add_edge("breaker", END)
+    # The breaker no longer ends the run: it hands to the operator, who
+    # decides whether another round is worth it.
+    graph.add_edge("breaker", "escalation")
+    graph.add_conditional_edges(
+        "escalation", after_escalation, {"pm": "pm", "coder": "coder", END: END}
+    )
 
     return graph.compile(checkpointer=checkpointer)
 
@@ -466,26 +606,42 @@ def _escalate(
     agent_id: str,
     kind: AlertKind,
     message: str,
+    origin: str,
     task_id: str | None = None,
-) -> None:
+) -> dict[str, str | None]:
     """Raise a blocking alert and park the agent.
 
-    Escalation is a supported terminal state, not a crash (CLAUDE.md §7). The
-    operator resolves it; nothing else does.
+    Escalation is a supported resting state, not a crash (CLAUDE.md §7). The
+    operator resolves it; nothing else does. The returned record is what
+    routes the graph into its interrupt — the alert and the suspension are
+    raised in the same breath so there can be no alert without a decision
+    waiting behind it.
     """
+    alert_id = f"alert-{uuid.uuid4().hex[:8]}"
+    actions = [AlertAction(id="retry", label="Retry this step")]
+    if task_id is not None:
+        # Skipping means "abandon this task, keep the run" — meaningless when
+        # planning itself failed, because there is no task list yet.
+        actions.append(AlertAction(id="skip", label="Skip this task"))
+    actions.append(AlertAction(id="abort", label="Abandon the run"))
+
     bench.world.set_status(agent_id, AgentStatus.ESCALATED, "needs a decision")
     bench.world.raise_alert(
         Alert(
-            alert_id=f"alert-{uuid.uuid4().hex[:8]}",
+            alert_id=alert_id,
             severity=AlertSeverity.ESCALATION,
             kind=kind,
             message=message,
             agent_id=agent_id,
             task_id=task_id,
-            actions=[
-                AlertAction(id="retry", label="Retry this step"),
-                AlertAction(id="abort", label="Abandon the run"),
-            ],
+            actions=actions,
             raised_at=datetime.now(UTC),
         )
     )
+    return {
+        "alert_id": alert_id,
+        "origin": origin,
+        "agent_id": agent_id,
+        "task_id": task_id,
+        "message": message,
+    }

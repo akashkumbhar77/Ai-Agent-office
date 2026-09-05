@@ -12,10 +12,13 @@ import type {
   Alert,
   FileOp,
   LogStream,
+  RunStatus,
   ServerEvent,
   Task,
   WorldSnapshotData,
 } from "@/lib/protocol";
+
+const IDLE_RUN: RunStatus = { phase: "idle", objective: null, alert_id: null };
 
 /** Per-agent log ring. Long runs are unbounded otherwise. */
 const MAX_LOG_CHARS = 60_000;
@@ -44,6 +47,7 @@ interface FableState {
   agents: Record<string, AgentState>;
   tasks: Record<string, Task>;
   alerts: Alert[];
+  run: RunStatus;
   logs: Record<string, LogChunk[]>;
   files: FileChange[];
   /** Set when the client detects it must resync — surfaced in the UI rather
@@ -64,6 +68,7 @@ export const useFableStore = create<FableState>((set) => ({
   agents: {},
   tasks: {},
   alerts: [],
+  run: IDLE_RUN,
   logs: {},
   files: [],
   desyncReason: null,
@@ -79,6 +84,7 @@ export const useFableStore = create<FableState>((set) => ({
       agents: { ...data.agents },
       tasks: { ...data.tasks },
       alerts: [...data.alerts],
+      run: data.run ?? IDLE_RUN,
       // Logs and files are event streams, not snapshot state — a resync
       // keeps what the operator has already seen rather than blanking it.
       lastSeq: seq,
@@ -195,6 +201,10 @@ export const useFableStore = create<FableState>((set) => ({
           };
           break;
         }
+
+        case "run.status":
+          next.run = event.data;
+          break;
 
         case "alert.raise":
           next.alerts = [

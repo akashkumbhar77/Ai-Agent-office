@@ -2,10 +2,12 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { AgentStatus, TaskState } from "@/lib/protocol";
+import type { AgentStatus, ClientMessage, TaskState } from "@/lib/protocol";
 import { totalPromptTokens } from "@/lib/protocol";
 import { useFableStore } from "@/lib/store";
-import { API_BASE } from "@/lib/ws";
+
+/** Returns false when the socket is not open. */
+export type Send = (...messages: ClientMessage[]) => boolean;
 
 const STATUS_DOT: Record<AgentStatus, string> = {
   idle: "bg-slate-500",
@@ -36,38 +38,26 @@ const STREAM_TONE: Record<string, string> = {
 
 // -- prompt bar ------------------------------------------------------------
 
-export function PromptBar({ sessionId }: { sessionId: string }) {
+export function PromptBar({ send }: { send: Send }) {
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
 
-  const agents = useFableStore((s) => s.agents);
-  const running = Object.values(agents).some(
-    (a) => a.status !== "idle" && a.status !== "escalated",
-  );
+  // The run phase comes from the server (PROTOCOL.md §4.10). It is not
+  // inferable from agent statuses: a run parked on an escalation and a
+  // finished run both leave every sprite idle.
+  const run = useFableStore((s) => s.run);
+  const connection = useFableStore((s) => s.connection);
+  const idle = run.phase === "idle";
 
-  async function submit() {
+  function submit() {
     const objective = text.trim();
-    if (!objective) return;
-    setBusy(true);
+    if (!objective || !idle) return;
     setError(null);
-    try {
-      const res = await fetch(`${API_BASE}/prompt`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: objective, session_id: sessionId }),
-      });
-      if (!res.ok) {
-        const body = (await res.json()) as { detail?: string };
-        setError(body.detail ?? `rejected (${res.status})`);
-      } else {
-        setText("");
-      }
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setBusy(false);
+    if (!send({ type: "prompt.submit", data: { text: objective } })) {
+      setError("not connected — the objective was not sent");
+      return;
     }
+    setText("");
   }
 
   return (
@@ -77,24 +67,38 @@ export function PromptBar({ sessionId }: { sessionId: string }) {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) void submit();
+            if (e.key === "Enter" && !e.shiftKey) submit();
           }}
           placeholder="Give the team an objective…"
-          className="flex-1 rounded border border-slate-800 bg-slate-950 px-3 py-2 text-sm outline-none placeholder:text-slate-600 focus:border-sky-700"
+          disabled={!idle}
+          className="flex-1 rounded border border-slate-800 bg-slate-950 px-3 py-2 text-sm outline-none placeholder:text-slate-600 focus:border-sky-700 disabled:opacity-50"
         />
         <button
           type="button"
-          onClick={() => void submit()}
-          disabled={busy || !text.trim()}
+          onClick={submit}
+          disabled={!idle || !text.trim() || connection !== "open"}
           className="rounded bg-sky-800 px-4 py-2 text-sm font-medium disabled:opacity-40"
         >
-          {busy ? "sending…" : "Start"}
+          Start
         </button>
+        {!idle && (
+          <button
+            type="button"
+            onClick={() => send({ type: "run.cancel", data: {} })}
+            className="rounded border border-slate-700 px-3 py-2 text-sm text-slate-300 hover:border-red-800 hover:text-red-300"
+          >
+            Cancel run
+          </button>
+        )}
       </div>
-      {running && (
+      {!idle && (
         <p className="text-[11px] text-slate-500">
-          A run is in flight — a second objective is refused rather than queued,
-          so two agents never fight over the same files.
+          {run.phase === "awaiting_operator"
+            ? "Waiting on your decision below. The run is suspended, not lost — resolving the escalation resumes it."
+            : "A run is in flight — a second objective is refused rather than queued, so two agents never fight over the same files."}
+          {run.objective && (
+            <span className="text-slate-600"> · {run.objective}</span>
+          )}
         </p>
       )}
       {error && <p className="text-[11px] text-red-400">{error}</p>}
@@ -161,14 +165,21 @@ export function WorkerTray({
 
 // -- alerts ----------------------------------------------------------------
 
-export function Alerts() {
+export function Alerts({ send }: { send: Send }) {
   const alerts = useFableStore((s) => s.alerts);
+  const run = useFableStore((s) => s.run);
+  const [note, setNote] = useState("");
+
   if (alerts.length === 0) return null;
 
   return (
     <div className="flex flex-col gap-2">
       {alerts.map((alert) => {
         const blocking = alert.severity === "escalation";
+        // Only the escalation the server is actually suspended on can be
+        // resolved. Any other blocking alert is history, and offering live
+        // buttons on it would invite a click that gets rejected.
+        const resolvable = blocking && run.alert_id === alert.alert_id;
         return (
           <div
             key={alert.alert_id}
@@ -177,26 +188,53 @@ export function Alerts() {
                 ? "border-red-800 bg-red-950/40 text-red-300"
                 : "border-amber-800 bg-amber-950/40 text-amber-300"
             }`}
+            data-alert-id={alert.alert_id}
+            data-alert-severity={alert.severity}
           >
-            <div className="font-medium">
-              {alert.kind.replace(/_/g, " ")}
-              {alert.agent_id && ` · ${alert.agent_id}`}
+            <div className="flex items-center gap-2 font-medium">
+              <span>
+                {alert.kind.replace(/_/g, " ")}
+                {alert.agent_id && ` · ${alert.agent_id}`}
+              </span>
+              {alert.recovery_eta_ms !== null && (
+                <span className="ml-auto font-mono text-[10px] opacity-70">
+                  retrying in {Math.round(alert.recovery_eta_ms / 1000)}s
+                </span>
+              )}
             </div>
             <div className="mt-0.5 text-slate-300">{alert.message}</div>
-            {alert.actions.length > 0 && (
-              <div className="mt-2 flex gap-2">
-                {alert.actions.map((action) => (
-                  <button
-                    key={action.id}
-                    type="button"
-                    disabled
-                    title="Operator resolution lands in Phase 4"
-                    className="rounded border border-slate-700 px-2 py-1 text-[11px] opacity-40"
-                  >
-                    {action.label}
-                  </button>
-                ))}
-              </div>
+
+            {resolvable && (
+              <>
+                <input
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                  placeholder="Optional instruction to send back with Retry…"
+                  className="mt-2 w-full rounded border border-slate-800 bg-slate-950 px-2 py-1 text-[11px] text-slate-200 outline-none placeholder:text-slate-600 focus:border-sky-700"
+                />
+                <div className="mt-2 flex gap-2">
+                  {alert.actions.map((action) => (
+                    <button
+                      key={action.id}
+                      type="button"
+                      onClick={() => {
+                        send({
+                          type: "escalation.resolve",
+                          data: {
+                            alert_id: alert.alert_id,
+                            action_id: action.id,
+                            note: note.trim() || null,
+                          },
+                        });
+                        setNote("");
+                      }}
+                      className="rounded border border-slate-600 px-2 py-1 text-[11px] text-slate-200 hover:border-sky-600 hover:text-sky-300"
+                    >
+                      {action.label}
+                    </button>
+                  ))}
+                </div>
+              </>
             )}
           </div>
         );

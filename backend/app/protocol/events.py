@@ -1,4 +1,4 @@
-"""Wire protocol v2 — mirror of docs/PROTOCOL.md.
+"""Wire protocol v3 — mirror of docs/PROTOCOL.md.
 
 This module is one of three places the protocol lives; the others are
 docs/PROTOCOL.md (source of truth) and frontend/lib/protocol.ts. A change to
@@ -13,7 +13,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 Tile = tuple[int, int]
 
@@ -68,6 +68,15 @@ class AlertSeverity(StrEnum):
     WARNING = "warning"
     ERROR = "error"
     ESCALATION = "escalation"
+
+
+class RunPhase(StrEnum):
+    IDLE = "idle"
+    RUNNING = "running"
+    # The graph is suspended at an escalation interrupt. Nothing advances
+    # until an operator resolves it — this is a supported resting state, not
+    # a stall (CLAUDE.md §7).
+    AWAITING_OPERATOR = "awaiting_operator"
 
 
 class AlertKind(StrEnum):
@@ -150,6 +159,20 @@ class Alert(BaseModel):
     raised_at: datetime
 
 
+class RunStatusData(BaseModel):
+    """The run lifecycle (PROTOCOL.md §5.5).
+
+    Not derivable from agent statuses: an escalated run and a finished one
+    both leave every sprite parked, and only the server knows whether the
+    graph is suspended at an interrupt.
+    """
+
+    phase: RunPhase = RunPhase.IDLE
+    objective: str | None = None
+    # Non-null exactly when phase is AWAITING_OPERATOR.
+    alert_id: str | None = None
+
+
 class TileClaim(BaseModel):
     """An array entry, not a map key — JSON object keys cannot be tuples and
     stringifying coordinates is a bug generator. See PROTOCOL.md §4.1.
@@ -172,6 +195,7 @@ class WorldSnapshotData(BaseModel):
     tasks: dict[str, Task]
     tile_claims: list[TileClaim]
     alerts: list[Alert]
+    run: RunStatusData = Field(default_factory=RunStatusData)
 
 
 class WorldSnapshot(BaseModel):
@@ -301,9 +325,15 @@ class AlertClear(BaseModel):
     data: AlertClearData
 
 
+class RunStatus(BaseModel):
+    type: Literal["run.status"] = "run.status"
+    data: RunStatusData
+
+
 ServerEvent = Annotated[
     WorldSnapshot
     | WorldDesync
+    | RunStatus
     | AgentSpawn
     | AgentMove
     | AgentStatusEvent
@@ -342,22 +372,23 @@ class EscalationResolve(BaseModel):
     data: EscalationResolveData
 
 
-class SessionControlData(BaseModel):
+class RunCancelData(BaseModel):
     pass
 
 
-class SessionPause(BaseModel):
-    type: Literal["session.pause"] = "session.pause"
-    data: SessionControlData = Field(default_factory=SessionControlData)
+class RunCancel(BaseModel):
+    """Cancel the in-flight run, including one suspended at an escalation.
 
+    Named `run.cancel` rather than `session.pause` because cancellation is
+    what it does: nothing resumes afterwards (PROTOCOL.md §6.3).
+    """
 
-class SessionResume(BaseModel):
-    type: Literal["session.resume"] = "session.resume"
-    data: SessionControlData = Field(default_factory=SessionControlData)
+    type: Literal["run.cancel"] = "run.cancel"
+    data: RunCancelData = Field(default_factory=RunCancelData)
 
 
 ClientMessage = Annotated[
-    PromptSubmit | EscalationResolve | SessionPause | SessionResume,
+    PromptSubmit | EscalationResolve | RunCancel,
     Field(discriminator="type"),
 ]
 

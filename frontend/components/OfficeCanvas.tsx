@@ -9,18 +9,18 @@ import { useEffect, useRef, useState } from "react";
 import * as Phaser from "phaser";
 
 import { OfficeScene } from "@/game/OfficeScene";
+import { emit } from "@/lib/bus";
 import type { Tile } from "@/lib/protocol";
-import { FableSocket } from "@/lib/ws";
+import { useFableStore } from "@/lib/store";
 
 const WIDTH = 30 * 32;
 const HEIGHT = 20 * 32;
 
 interface Props {
-  sessionId: string;
   onTileClick: (tile: Tile) => void;
 }
 
-export default function OfficeCanvas({ sessionId, onTileClick }: Props) {
+export default function OfficeCanvas({ onTileClick }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [ready, setReady] = useState(false);
   // Held in a ref so a changed handler does not tear down and rebuild Phaser.
@@ -33,7 +33,26 @@ export default function OfficeCanvas({ sessionId, onTileClick }: Props) {
     setReady(false);
     const scene = new OfficeScene();
     scene.tileClickHandler = (tile) => clickRef.current(tile);
-    scene.readyHandler = () => setReady(true);
+    scene.readyHandler = () => {
+      setReady(true);
+      // The scene only learns about agents from a `snapshot` bus event, and
+      // the socket does not own its arrival order relative to Phaser's async
+      // create(). Replaying what the store already holds makes the canvas
+      // correct regardless of which finished first.
+      const { sessionId, mapId, agents, tasks, alerts, run } =
+        useFableStore.getState();
+      if (!sessionId || !mapId) return;
+      emit("snapshot", {
+        session_id: sessionId,
+        map_id: mapId,
+        started_at: new Date().toISOString(),
+        agents,
+        tasks,
+        tile_claims: [],
+        alerts,
+        run,
+      });
+    };
 
     const game = new Phaser.Game({
       type: Phaser.AUTO,
@@ -49,14 +68,12 @@ export default function OfficeCanvas({ sessionId, onTileClick }: Props) {
       scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
     });
 
-    const socket = new FableSocket(sessionId);
-    socket.connect();
-
     return () => {
-      socket.close();
       game.destroy(true);
     };
-  }, [sessionId]);
+    // The socket is owned by the page, not the canvas: it carries prompts and
+    // escalation decisions too, and must not be torn down with the renderer.
+  }, []);
 
   return (
     <div

@@ -6,9 +6,13 @@ cyclic, so they get the most attention here.
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from app.agents.personas import CODER, PM, REVIEWER, ROSTER, WRITER
 from app.agents.toolbox import Toolbox
@@ -61,6 +65,36 @@ def script(bench: Workbench, *turns: Turn) -> FakeProvider:
     provider = FakeProvider(list(turns))
     bench.provider = provider
     return provider
+
+
+def resumable(bench: Workbench) -> tuple[Any, dict[str, Any]]:
+    """A graph that can suspend.
+
+    Escalations park the run on a LangGraph interrupt, and an interrupt needs
+    somewhere to persist state — without a checkpointer the graph has nothing
+    to resume from. Tests that drive an escalation must use this.
+    """
+    config = {
+        "configurable": {"thread_id": uuid.uuid4().hex},
+        "recursion_limit": 200,
+    }
+    return build_workflow(bench, checkpointer=InMemorySaver()), config
+
+
+def suspended_on(result: dict[str, Any]) -> dict[str, Any]:
+    """Assert the run is parked on exactly one escalation, and return it.
+
+    An interrupted invoke returns *only* `__interrupt__` — the accumulated
+    state is in the checkpoint, not the return value.
+    """
+    interrupts = result["__interrupt__"]
+    assert len(interrupts) == 1, f"expected one escalation, got {interrupts}"
+    value: dict[str, Any] = interrupts[0].value
+    return value
+
+
+def decide(action: str, note: str | None = None) -> Command:
+    return Command(resume={"action_id": action, "note": note})
 
 
 # -- scripting helpers: one entry per agent turn ---------------------------
@@ -223,17 +257,18 @@ async def test_loop_breaker_trips_and_escalates(bench: Workbench) -> None:
         turns += rejects("still wrong")
 
     script(bench, *turns)
-    app = build_workflow(bench)
-    result = await app.ainvoke({"objective": "go"}, config=DEEP)
+    app, config = resumable(bench)
+    result = await app.ainvoke({"objective": "go"}, config=config)
 
-    assert result["failure"]
-    assert "loop breaker" in result["failure"]
+    escalation = suspended_on(result)
+    assert escalation["origin"] == "breaker"
+    assert "without converging" in escalation["message"]
 
     task = next(iter(bench.world.tasks.values()))
     assert task.state is TaskState.ESCALATED
 
-    alerts = list(bench.world.alerts.values())
-    assert any(a.kind.value == "loop_breaker" for a in alerts)
+    alert = bench.world.alerts[escalation["alert_id"]]
+    assert alert.kind.value == "loop_breaker"
     assert bench.world.agents["coder-1"].status is AgentStatus.ESCALATED
     assert bench.world.agents["reviewer-1"].status is AgentStatus.ESCALATED
 
@@ -269,26 +304,25 @@ async def test_reviewer_without_a_verdict_is_not_treated_as_approval(
         *codes("a.py", "x"),
         Turn(text="I think it's probably fine"),  # no submit_review call
     )
-    app = build_workflow(bench)
-    result = await app.ainvoke({"objective": "go"}, config=DEEP)
+    app, config = resumable(bench)
+    result = await app.ainvoke({"objective": "go"}, config=config)
 
-    assert result["failure"]
+    assert suspended_on(result)["origin"] == "reviewer"
     task = next(iter(bench.world.tasks.values()))
     assert task.state is TaskState.ESCALATED
 
 
-async def test_coder_failure_stops_the_run(bench: Workbench) -> None:
+async def test_coder_failure_suspends_the_run(bench: Workbench) -> None:
     attempts = bench.settings.max_llm_retries + 1
     script(
         bench,
         *plan("One", "Two"),
         *[provider_error("boom") for _ in range(attempts)],
     )
-    app = build_workflow(bench)
-    result = await app.ainvoke({"objective": "go"}, config=DEEP)
+    app, config = resumable(bench)
+    result = await app.ainvoke({"objective": "go"}, config=config)
 
-    assert result["completed"] == []
-    assert result["failure"]
+    assert suspended_on(result)["origin"] == "coder"
     states = {t.state for t in bench.world.tasks.values()}
     assert TaskState.ESCALATED in states
     assert TaskState.QUEUED in states, "the second task never started"
@@ -314,14 +348,177 @@ async def test_writer_failure_does_not_fail_an_approved_task(
     assert task.state is TaskState.DONE
 
 
-async def test_pm_returning_no_tasks_is_a_failure(bench: Workbench) -> None:
+async def test_pm_returning_no_tasks_escalates(bench: Workbench) -> None:
     script(bench, Turn(text="Sure, I'll break that down!"))
-    app = build_workflow(bench)
-    result = await app.ainvoke({"objective": "go"}, config=DEEP)
+    app, config = resumable(bench)
+    result = await app.ainvoke({"objective": "go"}, config=config)
 
-    assert result["tasks"] == []
-    assert result["failure"]
+    escalation = suspended_on(result)
+    assert escalation["origin"] == "pm"
+    assert escalation["task_id"] is None
     assert bench.world.agents["pm-1"].status is AgentStatus.ESCALATED
+
+
+async def test_planning_escalation_offers_no_skip(bench: Workbench) -> None:
+    """Skip means "abandon this task, keep the run" — there is no task to
+    abandon when planning itself never produced one."""
+    script(bench, Turn(text="no tasks for you"))
+    app, config = resumable(bench)
+    result = await app.ainvoke({"objective": "go"}, config=config)
+
+    alert = bench.world.alerts[suspended_on(result)["alert_id"]]
+    assert [a.id for a in alert.actions] == ["retry", "abort"]
+
+
+async def test_task_escalation_offers_skip(bench: Workbench) -> None:
+    attempts = bench.settings.max_llm_retries + 1
+    script(bench, *plan("One"), *[provider_error("boom") for _ in range(attempts)])
+    app, config = resumable(bench)
+    result = await app.ainvoke({"objective": "go"}, config=config)
+
+    alert = bench.world.alerts[suspended_on(result)["alert_id"]]
+    assert [a.id for a in alert.actions] == ["retry", "skip", "abort"]
+
+
+# -- operator resolution ---------------------------------------------------
+
+
+async def test_retry_resumes_the_same_run_and_it_completes(bench: Workbench) -> None:
+    """The point of the interrupt: a recovered escalation continues the run
+    that stopped, rather than starting a new one."""
+    attempts = bench.settings.max_llm_retries + 1
+    script(
+        bench,
+        *plan("One"),
+        *[provider_error("boom") for _ in range(attempts)],
+        # After the operator says retry, the coder gets another chance.
+        *codes("a.py", "second time lucky"),
+        *approves(),
+        *writes_docs(),
+    )
+    app, config = resumable(bench)
+    result = await app.ainvoke({"objective": "go"}, config=config)
+    alert_id = suspended_on(result)["alert_id"]
+
+    resumed = await app.ainvoke(decide("retry"), config=config)
+
+    assert resumed["completed"] == list(bench.world.tasks)
+    assert next(iter(bench.world.tasks.values())).state is TaskState.DONE
+    # The alert is gone and nobody is left parked.
+    assert alert_id not in bench.world.alerts
+    assert all(
+        a.status is not AgentStatus.ESCALATED for a in bench.world.agents.values()
+    )
+
+
+async def test_retry_carries_the_operator_note_to_the_coder(
+    bench: Workbench,
+) -> None:
+    """Retry is a redirect, not just a repeat — otherwise the second attempt
+    has no more information than the first and fails the same way."""
+    attempts = bench.settings.max_llm_retries + 1
+    provider = script(
+        bench,
+        *plan("One"),
+        *[provider_error("boom") for _ in range(attempts)],
+        *codes("a.py", "x"),
+        *approves(),
+        *writes_docs(),
+    )
+    app, config = resumable(bench)
+    await app.ainvoke({"objective": "go"}, config=config)
+    await app.ainvoke(decide("retry", "use in-memory, not Redis"), config=config)
+
+    coder_prompts = [
+        m.content
+        for call in provider.calls
+        if call["system"] == CODER.system_prompt
+        for m in call["messages"]  # type: ignore[attr-defined]
+    ]
+    assert any("use in-memory, not Redis" in p for p in coder_prompts)
+
+
+async def test_skip_abandons_the_task_and_keeps_the_run(bench: Workbench) -> None:
+    attempts = bench.settings.max_llm_retries + 1
+    script(
+        bench,
+        *plan("Broken one", "Good one"),
+        *[provider_error("boom") for _ in range(attempts)],
+        # The second task runs after the first is skipped.
+        *codes("b.py", "fine"),
+        *approves(),
+        *writes_docs(),
+    )
+    app, config = resumable(bench)
+    await app.ainvoke({"objective": "go"}, config=config)
+    resumed = await app.ainvoke(decide("skip"), config=config)
+
+    states = {t.title: t.state for t in bench.world.tasks.values()}
+    assert states["Broken one"] is TaskState.ESCALATED, "skipping is not approving"
+    assert states["Good one"] is TaskState.DONE
+    assert len(resumed["completed"]) == 1
+
+
+async def test_abort_ends_the_run_and_clears_the_alert(bench: Workbench) -> None:
+    attempts = bench.settings.max_llm_retries + 1
+    script(
+        bench,
+        *plan("One", "Two"),
+        *[provider_error("boom") for _ in range(attempts)],
+    )
+    app, config = resumable(bench)
+    result = await app.ainvoke({"objective": "go"}, config=config)
+    alert_id = suspended_on(result)["alert_id"]
+
+    resumed = await app.ainvoke(decide("abort"), config=config)
+
+    assert resumed["completed"] == []
+    assert resumed["failure"]
+    assert alert_id not in bench.world.alerts, "a resolved alert must not linger"
+    assert all(
+        a.status is not AgentStatus.ESCALATED for a in bench.world.agents.values()
+    )
+
+
+async def test_resolution_emits_the_clear_the_client_needs(
+    bench: Workbench,
+) -> None:
+    """The banner comes down because the server says so, not because the
+    client guesses the alert is stale."""
+    script(bench, Turn(text="no tasks"))
+    app, config = resumable(bench)
+    result = await app.ainvoke({"objective": "go"}, config=config)
+    alert_id = suspended_on(result)["alert_id"]
+    bench.world.drain()
+
+    await app.ainvoke(decide("abort"), config=config)
+
+    cleared = [
+        e.data.alert_id for e in bench.world.drain() if e.type == "alert.clear"
+    ]
+    assert cleared == [alert_id]
+
+
+async def test_retry_after_the_breaker_resets_its_counter(bench: Workbench) -> None:
+    """Otherwise the resumed run trips the breaker again on its first
+    rejection, and 'retry' means one more round for nobody."""
+    limit = bench.settings.max_steps_per_subtask
+    turns: list[Turn] = [*plan("Never converges")]
+    for _ in range(limit + 2):
+        turns += codes("a.py", "attempt")
+        turns += rejects("still wrong")
+    # The round the operator bought, and this time review passes.
+    turns += codes("a.py", "final")
+    turns += approves()
+    turns += writes_docs()
+
+    script(bench, *turns)
+    app, config = resumable(bench)
+    await app.ainvoke({"objective": "go"}, config=config)
+    resumed = await app.ainvoke(decide("retry"), config=config)
+
+    assert len(resumed["completed"]) == 1
+    assert next(iter(bench.world.tasks.values())).state is TaskState.DONE
 
 
 # -- world projection ------------------------------------------------------

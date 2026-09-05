@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Literal
 
 import structlog
@@ -36,7 +37,13 @@ from app.llm.base import (
     StopReason,
     ToolSpec,
 )
-from app.protocol.events import AgentStatus, LogStream
+from app.protocol.events import (
+    AgentStatus,
+    Alert,
+    AlertKind,
+    AlertSeverity,
+    LogStream,
+)
 from app.tools.filesystem import FileEffect
 from app.world.state import World
 
@@ -231,6 +238,9 @@ class AgentRunner:
             except LLMError as exc:
                 last = exc
                 if not exc.retryable or attempt == self.max_retries:
+                    # Giving up: the banner's promise of a retry is no longer
+                    # true, and the escalation that follows is the real story.
+                    self.world.clear_alert(self._throttle_alert_id)
                     raise
 
                 hint = exc.retry_after_s if isinstance(exc, RateLimited) else None
@@ -245,17 +255,59 @@ class AgentRunner:
                 self.world.set_status(
                     self.spec.agent_id, AgentStatus.WAITING, _BUBBLES["waiting"]
                 )
+                self._raise_throttle_alert(
+                    exc, isinstance(exc, RateLimited), delay, attempt
+                )
                 await asyncio.sleep(delay)
                 continue
 
             if attempt:
-                # Recovered — put the sprite back to work.
+                # Recovered — put the sprite back to work and take the banner
+                # down. An alert that outlives its condition trains the
+                # operator to ignore the alert area (PROTOCOL.md §4.9).
+                self.world.clear_alert(self._throttle_alert_id)
                 self.world.set_status(
                     self.spec.agent_id, AgentStatus.WORKING, _BUBBLES["thinking"]
                 )
             return response
 
         raise last or LLMError("retries exhausted", retryable=False)
+
+    @property
+    def _throttle_alert_id(self) -> str:
+        """One alert per agent, reused across attempts.
+
+        Backoff can fire several times inside a single model call; a fresh
+        alert_id per attempt would stack banners for one condition.
+        """
+        return f"rate-limit-{self.spec.agent_id}"
+
+    def _raise_throttle_alert(
+        self, exc: LLMError, rate_limited: bool, delay: float, attempt: int
+    ) -> None:
+        """Surface backoff as a non-blocking banner.
+
+        Warning severity, no actions: the run recovers on its own, so there is
+        nothing for the operator to decide. It exists so a stalled office
+        reads as throttling rather than as a hang.
+        """
+        remaining = self.max_retries - attempt
+        self.world.raise_alert(
+            Alert(
+                alert_id=self._throttle_alert_id,
+                severity=AlertSeverity.WARNING,
+                kind=AlertKind.RATE_LIMIT if rate_limited else AlertKind.PROVIDER_ERROR,
+                message=(
+                    f"{self.spec.display_name} is throttled — retrying in "
+                    f"{delay:.0f}s ({remaining} attempt"
+                    f"{'' if remaining == 1 else 's'} left): {str(exc)[:120]}"
+                ),
+                agent_id=self.spec.agent_id,
+                recovery_eta_ms=int(delay * 1000),
+                actions=[],
+                raised_at=datetime.now(UTC),
+            )
+        )
 
 
 def _backoff(attempt: int, retry_after_s: float | None) -> float:

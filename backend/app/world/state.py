@@ -36,6 +36,9 @@ from app.protocol.events import (
     LogAppendData,
     LogStream,
     Persona,
+    RunPhase,
+    RunStatus,
+    RunStatusData,
     ServerEvent,
     Task,
     TaskState,
@@ -73,6 +76,7 @@ class World:
         self.tasks: dict[str, Task] = {}
         self.tile_claims: dict[Tile, str] = {}
         self.alerts: dict[str, Alert] = {}
+        self.run = RunStatusData()
 
         self._pending: list[ServerEvent] = []
 
@@ -106,8 +110,39 @@ class World:
                     for tile, agent_id in self.tile_claims.items()
                 ],
                 alerts=list(self.alerts.values()),
+                run=self.run.model_copy(),
             )
         )
+
+    def publish_snapshot(self) -> None:
+        """Queue a full snapshot for the next flush.
+
+        The only way to tell connected clients that entities were *removed*:
+        every other event is additive, so a client that already knows about a
+        task or an alert has no way to unlearn it otherwise.
+        """
+        self._emit(self.snapshot())
+
+    # -- run lifecycle -----------------------------------------------------
+
+    def set_run(
+        self,
+        phase: RunPhase,
+        objective: str | None = None,
+        alert_id: str | None = None,
+    ) -> None:
+        """Publish the run's phase.
+
+        `alert_id` is meaningful only while awaiting an operator; carrying it
+        in any other phase would leave the client rendering resolve buttons
+        for an escalation that is no longer suspended.
+        """
+        if phase is not RunPhase.AWAITING_OPERATOR:
+            alert_id = None
+        if phase is RunPhase.IDLE:
+            objective = None
+        self.run = RunStatusData(phase=phase, objective=objective, alert_id=alert_id)
+        self._emit(RunStatus(data=self.run.model_copy()))
 
     # -- agents ------------------------------------------------------------
 
