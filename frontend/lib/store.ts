@@ -10,10 +10,29 @@ import { create } from "zustand";
 import type {
   AgentState,
   Alert,
+  FileOp,
+  LogStream,
   ServerEvent,
   Task,
   WorldSnapshotData,
 } from "@/lib/protocol";
+
+/** Per-agent log ring. Long runs are unbounded otherwise. */
+const MAX_LOG_CHARS = 60_000;
+
+export interface LogChunk {
+  stream: LogStream;
+  text: string;
+}
+
+export interface FileChange {
+  path: string;
+  agent_id: string;
+  op: FileOp;
+  added: number;
+  removed: number;
+  at: string;
+}
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "unsupported";
 
@@ -25,6 +44,8 @@ interface FableState {
   agents: Record<string, AgentState>;
   tasks: Record<string, Task>;
   alerts: Alert[];
+  logs: Record<string, LogChunk[]>;
+  files: FileChange[];
   /** Set when the client detects it must resync — surfaced in the UI rather
    *  than hidden, because a silent resync loop looks like a hang. */
   desyncReason: string | null;
@@ -43,6 +64,8 @@ export const useFableStore = create<FableState>((set) => ({
   agents: {},
   tasks: {},
   alerts: [],
+  logs: {},
+  files: [],
   desyncReason: null,
 
   setConnection: (connection) => set({ connection }),
@@ -56,6 +79,8 @@ export const useFableStore = create<FableState>((set) => ({
       agents: { ...data.agents },
       tasks: { ...data.tasks },
       alerts: [...data.alerts],
+      // Logs and files are event streams, not snapshot state — a resync
+      // keeps what the operator has already seen rather than blanking it.
       lastSeq: seq,
       desyncReason: null,
     }),
@@ -183,9 +208,27 @@ export const useFableStore = create<FableState>((set) => ({
           next.alerts = state.alerts.filter((a) => a.alert_id !== event.data.alert_id);
           break;
 
+        case "log.append": {
+          const prior = state.logs[event.data.agent_id] ?? [];
+          const next_ = [...prior, { stream: event.data.stream, text: event.data.chunk }];
+          // Trim from the front once the ring exceeds its budget.
+          let total = next_.reduce((n, c) => n + c.text.length, 0);
+          while (total > MAX_LOG_CHARS && next_.length > 1) {
+            total -= next_.shift()!.text.length;
+          }
+          next.logs = { ...state.logs, [event.data.agent_id]: next_ };
+          break;
+        }
+
+        case "file.change":
+          next.files = [
+            ...state.files,
+            { ...event.data, at: new Date().toISOString() },
+          ].slice(-200);
+          break;
+
         default:
-          // log.append and file.change are consumed by the inspector panel in
-          // Phase 3; unknown types are ignored per PROTOCOL.md §8.
+          // Unknown types are ignored per PROTOCOL.md §8.
           break;
       }
 

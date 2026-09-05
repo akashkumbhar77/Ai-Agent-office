@@ -65,12 +65,12 @@ async function clickTile(page: Page, tx: number, ty: number) {
 }
 
 function trayRow(page: Page, name: string): Locator {
-  return page.locator("li").filter({ hasText: name }).locator("button");
+  return page.getByRole("button").filter({ hasText: name });
 }
 
-/** The detail line under an agent, e.g. "tile 6,2 → 24,16 · 0 tok". */
+/** The coordinate line inside an agent's tray card, e.g. "6,2 → 24,16 · 0 tok". */
 function trayLine(page: Page, name: string): Locator {
-  return page.locator("li").filter({ hasText: name }).locator("div").first();
+  return trayRow(page, name).locator("div").last();
 }
 
 /**
@@ -116,7 +116,7 @@ test.describe("Phase 1 acceptance", () => {
     for (const [name, [x, y]] of Object.entries(SEED)) {
       await expect(trayRow(page, name)).toBeVisible();
       await expect(trayRow(page, name)).toContainText("idle");
-      await expect(trayLine(page, name)).toContainText(`tile ${x},${y}`);
+      await expect(trayLine(page, name)).toContainText(`${x},${y}`);
     }
 
     // Screenshot of just the canvas — this is the artifact a human reviews to
@@ -146,7 +146,7 @@ test.describe("Phase 1 acceptance", () => {
     // Arrival: the server settles her to idle at the target tile.
     await expect(trayRow(page, "Ada")).toContainText("idle", { timeout: 15_000 });
     await expect(trayLine(page, "Ada")).toContainText(
-      `tile ${RIGHT_ROOM[0]},${RIGHT_ROOM[1]}`,
+      `${RIGHT_ROOM[0]},${RIGHT_ROOM[1]}`,
     );
     await expect(trayLine(page, "Ada")).not.toContainText("→");
 
@@ -192,7 +192,7 @@ test.describe("Phase 1 acceptance", () => {
 
     // And it still completes after the reload.
     await expect(trayRow(page, "Cy")).toContainText("idle", { timeout: 30_000 });
-    await expect(trayLine(page, "Cy")).toContainText("tile 3,12");
+    await expect(trayLine(page, "Cy")).toContainText("3,12");
     expect(consoleErrors).toEqual([]);
   });
 

@@ -14,6 +14,9 @@ export default defineConfig({
   workers: 1,
   retries: 0,
   reporter: [["list"]],
+  // @live specs drive a real provider: slow, costly, non-deterministic.
+  // Opt in with `npx playwright test --grep @live`.
+  grepInvert: process.env.PLAYWRIGHT_LIVE ? undefined : /@live/,
   use: {
     baseURL: "http://127.0.0.1:3000",
     viewport: { width: 1500, height: 1000 },
