@@ -37,6 +37,7 @@ from app.llm.base import (
     ToolSpec,
 )
 from app.protocol.events import AgentStatus, LogStream
+from app.tools.filesystem import FileEffect
 from app.world.state import World
 
 log = structlog.get_logger(__name__)
@@ -57,6 +58,9 @@ class AgentOutcome:
     stopped: Stopped
     iterations: int
     control: list[ControlSignal] = field(default_factory=list)
+    # Files this agent touched. The reviewer cannot review a change it
+    # cannot see, so this is how the diff reaches the next node.
+    effects: list[FileEffect] = field(default_factory=list)
     error: str | None = None
 
     @property
@@ -89,6 +93,7 @@ class AgentRunner:
     async def run(self, messages: list[Message]) -> AgentOutcome:
         history = list(messages)
         control: list[ControlSignal] = []
+        effects: list[FileEffect] = []
         specs = self.toolbox.specs()
 
         self.world.set_status(
@@ -102,7 +107,7 @@ class AgentRunner:
                 self.world.set_status(self.spec.agent_id, AgentStatus.IDLE, None)
                 return AgentOutcome(
                     text="", stopped="provider_error", iterations=iteration,
-                    control=control, error=str(exc),
+                    control=control, effects=effects, error=str(exc),
                 )
 
             self.world.record_usage(self.spec.agent_id, response.model, response.usage)
@@ -116,7 +121,8 @@ class AgentRunner:
                 self.world.set_status(self.spec.agent_id, AgentStatus.IDLE, None)
                 return AgentOutcome(
                     text=response.text, stopped="refusal", iterations=iteration,
-                    control=control, error="the model declined this request",
+                    control=control, effects=effects,
+                    error="the model declined this request",
                 )
 
             if response.stop_reason is StopReason.MAX_TOKENS:
@@ -125,7 +131,7 @@ class AgentRunner:
                 self.world.set_status(self.spec.agent_id, AgentStatus.IDLE, None)
                 return AgentOutcome(
                     text=response.text, stopped="max_tokens", iterations=iteration,
-                    control=control,
+                    control=control, effects=effects,
                     error=f"response hit the {self.max_tokens}-token cap",
                 )
 
@@ -133,11 +139,11 @@ class AgentRunner:
                 self.world.set_status(self.spec.agent_id, AgentStatus.IDLE, None)
                 return AgentOutcome(
                     text=response.text, stopped="end_turn", iterations=iteration,
-                    control=control,
+                    control=control, effects=effects,
                 )
 
             history.append(response.as_message())
-            had_error = False
+            misused = False
 
             for call in response.tool_calls:
                 self.world.append_log(
@@ -146,10 +152,22 @@ class AgentRunner:
                     f"$ {call.name} {call.arguments}\n",
                 )
                 dispatch = self.toolbox.dispatch(call)
-                had_error = had_error or dispatch.result.is_error
+                misused = misused or dispatch.result.misuse
+
+                if dispatch.result.is_error:
+                    # Also to structlog: a systematically bad tool call is
+                    # invisible server-side if it only reaches the UI stream.
+                    log.warning(
+                        "tool_call_rejected",
+                        agent_id=self.spec.agent_id,
+                        tool=call.name,
+                        arguments=call.arguments,
+                        reason=dispatch.result.content[:300],
+                    )
 
                 if dispatch.effect is not None:
                     effect = dispatch.effect
+                    effects.append(effect)
                     self.world.record_file_change(
                         effect.path,
                         self.spec.agent_id,
@@ -179,8 +197,8 @@ class AgentRunner:
             # happened, then cleared on the next successful turn.
             self.world.set_status(
                 self.spec.agent_id,
-                AgentStatus.CONFUSED if had_error else AgentStatus.WORKING,
-                _BUBBLES["confused"] if had_error else _BUBBLES["thinking"],
+                AgentStatus.CONFUSED if misused else AgentStatus.WORKING,
+                _BUBBLES["confused"] if misused else _BUBBLES["thinking"],
             )
 
         # Falling out of the loop is a failure, not a completion. Reporting it
@@ -188,7 +206,7 @@ class AgentRunner:
         self.world.set_status(self.spec.agent_id, AgentStatus.ESCALATED, "stuck")
         return AgentOutcome(
             text="", stopped="max_iterations", iterations=self.max_iterations,
-            control=control,
+            control=control, effects=effects,
             error=f"made {self.max_iterations} tool rounds without finishing",
         )
 

@@ -277,3 +277,71 @@ def test_unparseable_quoting_is_reported(shell: ShellTool) -> None:
 
 def test_empty_command_is_refused(shell: ShellTool) -> None:
     assert shell.run_command(RunCommandInput(command="   ")).is_error
+
+
+# -- misuse vs negative result ---------------------------------------------
+#
+# `misuse` drives the `confused` sprite state. Conflating it with any failed
+# call made the office show confusion for ordinary exploration — an observed
+# live bug, where a writer checking for a non-existent docs/ directory looked
+# like a malfunctioning agent.
+
+
+def test_missing_file_is_not_misuse(files: FileTools) -> None:
+    result = files.read_file(ReadFileInput(path="nope.py"))
+    assert result.is_error and not result.misuse
+
+
+def test_missing_directory_is_not_misuse(files: FileTools) -> None:
+    """The exact live case: an agent checking whether docs/ exists."""
+    result = files.list_dir(ListDirInput(path="docs"))
+    assert result.is_error and not result.misuse
+
+
+def test_escaping_the_workspace_is_misuse(files: FileTools) -> None:
+    result = files.read_file(ReadFileInput(path="../secret.txt"))
+    assert result.is_error and result.misuse
+
+
+def test_wrong_tool_for_the_target_is_misuse(files: FileTools) -> None:
+    assert files.read_file(ReadFileInput(path="src")).misuse
+    assert files.list_dir(ListDirInput(path="README.md")).misuse
+
+
+def test_editing_stale_or_ambiguous_text_is_misuse(
+    files: FileTools, ws: Workspace
+) -> None:
+    stale = files.edit_file(
+        EditFileInput(path="src/auth.py", old_text="absent", new_text="x")
+    )
+    assert stale.misuse, "acting on state the agent did not verify"
+
+    (ws.root / "dup.py").write_text("a\na\n")
+    ambiguous = files.edit_file(
+        EditFileInput(path="dup.py", old_text="a", new_text="b")
+    )
+    assert ambiguous.misuse
+
+
+def test_disallowed_command_is_misuse(shell: ShellTool) -> None:
+    assert shell.run_command(RunCommandInput(command="curl x")).misuse
+
+
+def test_shell_operators_are_misuse(shell: ShellTool) -> None:
+    assert shell.run_command(RunCommandInput(command="ls && ls")).misuse
+
+
+def test_a_failing_command_is_neither_error_nor_misuse(shell: ShellTool) -> None:
+    """A failing test suite is information the agent must reason about."""
+    result = shell.run_command(RunCommandInput(command="ls definitely-absent"))
+    assert not result.is_error and not result.misuse
+
+
+def test_timeout_is_an_error_but_not_misuse(ws: Workspace) -> None:
+    shell = ShellTool(ws, allowlist=frozenset({"python3"}))
+    result = shell.run_command(
+        RunCommandInput(
+            command="python3 -c \"__import__('time').sleep(5)\"", timeout_s=1
+        )
+    )
+    assert result.is_error and not result.misuse

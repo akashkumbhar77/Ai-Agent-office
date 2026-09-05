@@ -407,3 +407,33 @@ def test_stop_reason_enum_is_fully_handled() -> None:
         StopReason.REFUSAL,
     }
     assert set(StopReason) == handled
+
+
+async def test_exploring_a_missing_path_does_not_show_confused(
+    world: World, coder_box: Toolbox
+) -> None:
+    """Observed live bug: an agent checking for a directory that does not
+    exist was rendered as `confused`, which made the signal meaningless."""
+    provider = FakeProvider(
+        [calls_tool("list_dir", {"path": "docs"}), Turn(text="no docs dir")]
+    )
+    await runner(world, provider, CODER, coder_box).run([])
+
+    statuses = [e.data.status for e in world.drain() if e.type == "agent.status"]
+    assert AgentStatus.CONFUSED not in statuses
+
+
+async def test_real_misuse_still_shows_confused(
+    world: World, coder_box: Toolbox
+) -> None:
+    provider = FakeProvider(
+        [
+            calls_tool("read_file", {}),  # schema violation
+            calls_tool("read_file", {"path": "src/auth.py"}),
+            Turn(text="ok"),
+        ]
+    )
+    await runner(world, provider, CODER, coder_box).run([])
+
+    statuses = [e.data.status for e in world.drain() if e.type == "agent.status"]
+    assert AgentStatus.CONFUSED in statuses

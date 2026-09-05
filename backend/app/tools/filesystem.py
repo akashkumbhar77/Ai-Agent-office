@@ -33,8 +33,21 @@ class FileEffect:
 
 @dataclass
 class ToolResult:
+    """Outcome of one tool call.
+
+    `is_error` means the call did not produce what was asked for.
+    `misuse` means the *agent* got the call wrong — bad schema, wrong tool,
+    a path outside the workspace, acting on stale state.
+
+    The distinction matters because misuse drives the `confused` sprite
+    state. A missing file is a normal exploratory result; flagging it as
+    confusion makes the signal meaningless and makes the office lie about
+    what the agent is doing.
+    """
+
     content: str
     is_error: bool = False
+    misuse: bool = False
     effect: FileEffect | None = None
 
 
@@ -68,13 +81,13 @@ class FileTools:
         try:
             target = self.ws.resolve(args.path)
         except WorkspaceViolation as exc:
-            return ToolResult(str(exc), is_error=True)
+            return ToolResult(str(exc), is_error=True, misuse=True)
 
         if not target.exists():
             return ToolResult(f"No such file: {args.path}", is_error=True)
         if target.is_dir():
             return ToolResult(
-                f"{args.path} is a directory; use list_dir", is_error=True
+                f"{args.path} is a directory; use list_dir", is_error=True, misuse=True
             )
 
         raw = target.read_bytes()
@@ -91,10 +104,10 @@ class FileTools:
         try:
             target = self.ws.resolve(args.path)
         except WorkspaceViolation as exc:
-            return ToolResult(str(exc), is_error=True)
+            return ToolResult(str(exc), is_error=True, misuse=True)
 
         if target.is_dir():
-            return ToolResult(f"{args.path} is a directory", is_error=True)
+            return ToolResult(f"{args.path} is a directory", is_error=True, misuse=True)
 
         existed = target.exists()
         previous = target.read_text(errors="replace") if existed else ""
@@ -117,7 +130,7 @@ class FileTools:
         try:
             target = self.ws.resolve(args.path)
         except WorkspaceViolation as exc:
-            return ToolResult(str(exc), is_error=True)
+            return ToolResult(str(exc), is_error=True, misuse=True)
 
         if not target.exists():
             return ToolResult(f"No such file: {args.path}", is_error=True)
@@ -132,12 +145,14 @@ class FileTools:
                 f"old_text not found in {args.path}. The file may have changed "
                 f"since you read it; read it again before editing.",
                 is_error=True,
+                misuse=True,
             )
         if occurrences > 1:
             return ToolResult(
                 f"old_text appears {occurrences} times in {args.path}; it must "
                 f"match exactly once. Include more surrounding context.",
                 is_error=True,
+                misuse=True,
             )
 
         updated = original.replace(args.old_text, args.new_text)
@@ -157,12 +172,14 @@ class FileTools:
         try:
             target = self.ws.resolve(args.path)
         except WorkspaceViolation as exc:
-            return ToolResult(str(exc), is_error=True)
+            return ToolResult(str(exc), is_error=True, misuse=True)
 
         if not target.exists():
             return ToolResult(f"No such directory: {args.path}", is_error=True)
         if not target.is_dir():
-            return ToolResult(f"{args.path} is a file; use read_file", is_error=True)
+            return ToolResult(
+                f"{args.path} is a file; use read_file", is_error=True, misuse=True
+            )
 
         entries = sorted(
             target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())

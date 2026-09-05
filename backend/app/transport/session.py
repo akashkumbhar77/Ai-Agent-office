@@ -220,7 +220,14 @@ class Session:
             self._run.cancel()
 
     async def _execute(self, objective: str) -> None:
-        config = {"configurable": {"thread_id": f"{self.session_id}-run"}}
+        # The graph is cyclic (coder <-> reviewer). LangGraph's default
+        # recursion limit of 25 counts node visits, so a handful of tasks
+        # with rework would abort mid-run. Budget generously: the real
+        # bound on looping is the step_count breaker, not this.
+        config = {
+            "configurable": {"thread_id": f"{self.session_id}-run"},
+            "recursion_limit": 200,
+        }
         try:
             result = await self.workflow.ainvoke({"objective": objective}, config=config)
             log.info(

@@ -10,6 +10,10 @@ describe the tasks in prose first; the tool call is the deliverable.
 
 What makes a good task here:
 
+- Every task must change the codebase. An engineer will implement it and a
+  reviewer will then review the change, so a task that only reads or
+  investigates gives the reviewer nothing to review and stalls the run.
+  Fold any necessary reading into the task that acts on it.
 - One clear outcome per task, small enough that a single engineer finishes it
   without further breakdown.
 - Ordered so that each task can start once the ones before it are done.

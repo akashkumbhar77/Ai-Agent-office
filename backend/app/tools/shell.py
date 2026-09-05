@@ -76,12 +76,14 @@ class ShellTool:
     def run_command(self, args: RunCommandInput) -> ToolResult:
         command = args.command.strip()
         if not command:
-            return ToolResult("command is empty", is_error=True)
+            return ToolResult("command is empty", is_error=True, misuse=True)
 
         try:
             argv, operator = _tokenize(command)
         except ValueError as exc:
-            return ToolResult(f"Could not parse command: {exc}", is_error=True)
+            return ToolResult(
+                f"Could not parse command: {exc}", is_error=True, misuse=True
+            )
 
         if operator is not None:
             return ToolResult(
@@ -89,10 +91,11 @@ class ShellTool:
                 f"quotes. Run one program at a time; if you need to combine "
                 f"steps, run them as separate calls.",
                 is_error=True,
+                misuse=True,
             )
 
         if not argv:
-            return ToolResult("command is empty", is_error=True)
+            return ToolResult("command is empty", is_error=True, misuse=True)
 
         executable = argv[0]
         if executable not in self.allowlist:
@@ -100,6 +103,7 @@ class ShellTool:
                 f"{executable!r} is not an allowed command. Allowed: "
                 f"{', '.join(sorted(self.allowlist))}",
                 is_error=True,
+                misuse=True,
             )
 
         try:

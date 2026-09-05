@@ -154,6 +154,7 @@ class Toolbox:
                     f"{call.name!r} is not a tool you can use. Available: "
                     f"{', '.join(self.allowed)}",
                     is_error=True,
+                    misuse=True,
                 )
             )
 
@@ -166,6 +167,7 @@ class Toolbox:
                     f"the call with a well-formed JSON object matching the "
                     f"tool's schema.",
                     is_error=True,
+                    misuse=True,
                 )
             )
 
@@ -173,7 +175,9 @@ class Toolbox:
         try:
             args = schema.model_validate(call.arguments)
         except ValidationError as exc:
-            return Dispatch(ToolResult(_explain(call.name, exc), is_error=True))
+            return Dispatch(
+                ToolResult(_explain(call.name, exc), is_error=True, misuse=True)
+            )
 
         return self._run(call.name, args)
 
@@ -208,6 +212,7 @@ class Toolbox:
                             "A rejection needs at least one reason. Re-submit "
                             "with the specific findings.",
                             is_error=True,
+                            misuse=True,
                         )
                     )
                 verdict = "approved" if args.approved else "changes requested"
