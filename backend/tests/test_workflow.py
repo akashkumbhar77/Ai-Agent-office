@@ -19,7 +19,7 @@ from app.agents.toolbox import Toolbox
 from app.config import Settings, get_settings
 from app.graph.workflow import Workbench, build_workflow
 from app.llm.fake import FakeProvider, Turn, calls_tool, provider_error
-from app.protocol.events import AgentStatus, TaskState
+from app.protocol.events import AgentStatus, AlertKind, TaskState
 from app.tools.filesystem import FileTools
 from app.tools.shell import ShellTool
 from app.tools.workspace import Workspace
@@ -195,6 +195,21 @@ async def test_handoff_is_a_meeting(bench: Workbench) -> None:
     assert "reviewing the change" in reasons
 
 
+async def test_the_meeting_ends_when_the_review_does(bench: Workbench) -> None:
+    """Found live: the coder sat in `meeting` at the table for the rest of the
+    run. Its own runner had already finished when the reviewer node set the
+    status, so nothing ever cleared it and the office showed a handoff that
+    had ended minutes earlier."""
+    script(bench, *plan("One"), *codes("a.py", "x"), *approves(), *writes_docs())
+    app = build_workflow(bench)
+    await app.ainvoke({"objective": "go"}, config=DEEP)
+
+    coder = bench.world.agents[CODER.agent_id]
+    assert coder.status is not AgentStatus.MEETING
+    # And back at the desk, not left standing at the meeting table.
+    assert (coder.target or coder.tile) == bench.desk_for(CODER)
+
+
 # -- the rejection loop ----------------------------------------------------
 
 
@@ -357,6 +372,23 @@ async def test_pm_returning_no_tasks_escalates(bench: Workbench) -> None:
     assert escalation["origin"] == "pm"
     assert escalation["task_id"] is None
     assert bench.world.agents["pm-1"].status is AgentStatus.ESCALATED
+
+
+async def test_a_stalled_pm_is_not_reported_as_a_provider_error(
+    bench: Workbench,
+) -> None:
+    """Found live. The PM ran out of iterations and the banner said
+    `provider error`, which sends the operator to check their API key for a
+    failure the provider had no part in."""
+    cap = bench.settings.max_steps_per_subtask
+    # Every turn calls a tool, so the agent never finishes and hits the cap.
+    script(bench, *[calls_tool("create_tasks", {"tasks": []}) for _ in range(cap)])
+    app, config = resumable(bench)
+    result = await app.ainvoke({"objective": "go"}, config=config)
+
+    alert = bench.world.alerts[suspended_on(result)["alert_id"]]
+    assert alert.kind is AlertKind.LOOP_BREAKER
+    assert "tool rounds without finishing" in alert.message
 
 
 async def test_planning_escalation_offers_no_skip(bench: Workbench) -> None:

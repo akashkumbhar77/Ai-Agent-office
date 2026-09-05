@@ -200,7 +200,12 @@ def build_workflow(bench: Workbench, checkpointer: Any | None = None) -> Any:
                 "escalation": _escalate(
                     bench,
                     spec.agent_id,
-                    AlertKind.PROVIDER_ERROR if outcome.error else AlertKind.TOOL_ERROR,
+                    # Classify by how the agent stopped, not by whether it
+                    # produced an error string. Found live: a PM that hit its
+                    # iteration cap was labelled `provider_error`, which sends
+                    # the operator off to check their API key for a failure
+                    # that had nothing to do with the provider.
+                    _alert_kind(outcome),
                     f"Decomposition failed: {reason}",
                     origin="pm",
                 ),
@@ -325,6 +330,17 @@ def build_workflow(bench: Workbench, checkpointer: Any | None = None) -> Any:
         )
 
         bench.walk_to(spec, bench.desk_for(spec), "back to desk")
+
+        # The meeting is over, so the coder must stop showing one. Nothing
+        # else clears it: the coder's own runner set MEETING *after* it
+        # finished, so it sat at the table in `meeting` for the rest of the
+        # run while the office claimed a handoff that had already ended.
+        # IDLE first, then walk — walking sets WALKING and the arrival settles
+        # it back to IDLE, but a coder already at its desk never walks and
+        # would keep the stale status.
+        if bench.world.agents[CODER.agent_id].status is AgentStatus.MEETING:
+            bench.world.set_status(CODER.agent_id, AgentStatus.IDLE, None)
+        bench.walk_to(CODER, bench.desk_for(CODER), "back to desk")
 
         verdicts = [c for c in outcome.control if isinstance(c, ReviewSubmitted)]
 
