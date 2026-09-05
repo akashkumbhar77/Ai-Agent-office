@@ -124,6 +124,7 @@ Rules that follow from this table:
 
 - Agents execute code and touch the filesystem. **Confine every file operation to the configured workspace root.** Resolve model-supplied paths to canonical form and reject anything that escapes the root (`..`, symlinks, absolute paths). Never pass a raw model-supplied path to `open()`.
 - Shell commands from agents run against an **allowlist** of executables, with shell operators (`&&`, `|`, `;`, backticks, `$()`) rejected. A blocklist is not sufficient. Prefer running them in a container.
+- **Known gap, do not assume otherwise:** `ShellTool` checks `argv[0]` and nothing else. Arguments never reach the `resolve()` chokepoint, so shell commands are *not* confined to the workspace, and the allowlist includes interpreters. The rule above is the target, not the current state — see `docs/PLAN.md` §6 Phase 5.1. Anything you build that relies on shell confinement is relying on something that is not there yet.
 - Secrets live in `.env` (gitignored) and reach the process as environment variables. They never enter a prompt, a log line, a WebSocket frame, or the frontend bundle.
 - Treat all agent-authored content as untrusted input to the rest of the system, including to other agents.
 

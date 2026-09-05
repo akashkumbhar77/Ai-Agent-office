@@ -216,11 +216,21 @@ becoming a mysterious pathfinding bug later.
 
 ## Safety
 
-Agents write files and run commands. Every path is resolved to canonical form
-and confined to `WORKSPACE_ROOT`; shell commands are checked against an
-allowlist with shell operators rejected. **Point `WORKSPACE_ROOT` at a
-scratch directory you do not mind an agent editing** — not at this repo, and
-not at anything you have not committed.
+Agents write files and run commands.
+
+**Run this on a machine you would be willing to hand to a stranger, or inside
+a VM.** The file tools are confined — every path is resolved to canonical form
+and rejected if it escapes `WORKSPACE_ROOT`. The **shell tool is not**: it
+checks only the name of the program, never its arguments, so an allowlisted
+`cat` reads any file on the host, and the allowlist includes `python`, `npm`,
+`npx` and `git` — which are arbitrary code execution and network access.
+Pointing `WORKSPACE_ROOT` at a scratch directory bounds what the *file* tools
+touch and nothing else.
+
+This is a known gap with a confirmed reproduction, not a theoretical one; the
+fix is `docs/PLAN.md` §6 Phase 5.1 — argument confinement, then a container.
+Until it lands, treat a running agent as having the same reach as the account
+the backend runs under.
 
 Secrets live in `backend/.env`, which is gitignored, and reach the process as
 environment variables. They never enter a prompt, a log line, a WebSocket

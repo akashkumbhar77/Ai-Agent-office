@@ -31,9 +31,19 @@ from pydantic import BaseModel, Field
 from app.tools.filesystem import ToolResult
 from app.tools.workspace import Workspace
 
-# Read-only inspection plus the test/lint runners an agent needs to verify its
-# own work. Deliberately excludes anything that installs, fetches, or mutates
-# state outside the workspace.
+# Inspection plus the test/lint runners an agent needs to verify its own work.
+#
+# WARNING: this list is not a security boundary, and until Phase 5.1 lands
+# there is no other one on this tool. Only `argv[0]` is checked — no argument
+# is inspected, so an allowlisted `cat` reads any file on the host, and
+# `python`, `npm`, `npx` and `git` are general-purpose execution and network
+# access (`python -c` runs anything, `npx` fetches and runs a package,
+# `git push` exfiltrates).
+#
+# Treat this as a UX guardrail that keeps agents on the tools they need, and
+# assume anything it permits can reach the whole machine. See PLAN.md §6
+# Phase 5.1 for the two-layer fix: argument confinement through the same
+# resolve() chokepoint the file tools use, then a container.
 DEFAULT_ALLOWLIST: frozenset[str] = frozenset(
     {
         "ls", "cat", "head", "tail", "wc", "find", "grep", "rg", "diff",

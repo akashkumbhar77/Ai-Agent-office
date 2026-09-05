@@ -273,6 +273,161 @@ Not done, and why:
 - **Redis-backed `WorldState` (item 6)** — the v1 topology is one process. Adding a second store with no second process is the same premature generality the Phase 3 review deleted.
 - **Visual polish (item 8)** — cosmetic, and none of it changes what the system does.
 
+### Phase 5 — Containment, cost, and concurrency (Weeks 9–12)
+
+Goal: safe to point at code you care about, bounded in what it can spend, and
+actually an office rather than a relay race.
+
+The four tracks are ordered by dependency, not by appeal. 5.1 blocks nothing
+technically but blocks *use*; 5.3 multiplies token burn and so must land after
+5.2.
+
+#### 5.1 Containment — the shell tool is not confined
+
+**The defect.** `Workspace.resolve()` is the confinement chokepoint, and
+`run_command` does not use it. It sets `cwd` to the workspace root, checks
+`argv[0]` against the allowlist, and passes every remaining argument through
+untouched. Verified, not theorised:
+
+```
+cat /etc/hostname                                  -> exit 0
+ls /path/to/this/repo/backend                      -> exit 0
+python3 -c "open('/tmp/ESCAPED.txt','w').write(…)" -> is_error=False, file written
+```
+
+Two independent holes. Allowlisted *inert* binaries read anywhere on the host,
+because no argument is ever checked. And `python`, `npm`, `npx`, `git` are
+general-purpose execution and network: `python -c` runs anything, `npx` fetches
+and runs a package, `git push` exfiltrates. The comment above the allowlist
+claims it "deliberately excludes anything that installs, fetches, or mutates
+state outside the workspace", which is false — and a false comment is worse
+than no comment, because it is what a reviewer reads instead of the code.
+
+This also means the code contradicts `CLAUDE.md` §8, which requires *every*
+file operation to be confined. A shell `cat` is a file operation.
+
+**The fix, in two layers.**
+
+1. **Argument confinement.** Every argument is resolved through the same
+   `resolve()` chokepoint the file tools use. Absolute paths and anything
+   escaping the root are rejected. Deliberately *not* a heuristic that guesses
+   which arguments are paths — an argument that looks like a path and escapes
+   is rejected whether or not it was meant as one, because failing closed on an
+   ambiguous case is the correct trade here.
+2. **A sandbox.** Each command runs in a short-lived container: workspace
+   bind-mounted at `/workspace`, `--network none`, non-root, memory/PID/CPU
+   caps, wall-clock timeout. Once this exists the allowlist stops being the
+   security boundary and becomes a UX guardrail — which is the only honest
+   place for it, since an allowlist containing an interpreter was never a
+   boundary at all.
+
+**Rejected: flag-level filtering** (`python` but not `python -c`, `git` but not
+`git push`). That is a blocklist wearing an allowlist's clothes, and
+`CLAUDE.md` §8 rejects blocklists for exactly the reason they fail here — the
+next interpreter flag nobody thought of.
+
+**Degradation must be visible, not silent.** `SANDBOX=auto` uses docker or
+podman if present. With no runtime available the allowlist drops to the inert
+set only, and the office raises a standing `warning` alert saying so. Running
+`SANDBOX=off` is permitted — this is a local dev tool — but it too raises the
+banner. A tool whose product is visibility must not hide its own weakened
+state.
+
+**Acceptance:** an escape-attempt suite — absolute read, `..` traversal,
+symlink out, `python -c` write, `npx`, `git push` — each rejected or contained,
+with the reproduction above as a regression test. Sandbox-off shows the banner.
+The false comment is gone.
+
+#### 5.2 A cost ceiling
+
+`§7` of this document lists *"Token cost on long agentic runs"* at High/High
+with the mitigation *"per-agent budget caps that trip the breaker"*. That
+mitigation was never built. The only bounds today are step counters, which
+bound *rounds*, not spend — a task with large files burns unboundedly inside
+its allowance.
+
+**Design.** `World.record_usage` is already the single chokepoint every model
+call passes through, so the accumulator goes there. Prices come from config
+keyed by model id, never hardcoded, and an unrecognised model shows tokens with
+no dollar figure and logs once — a guessed price is worse than no price.
+
+Crossing the ceiling does not kill the run. It escalates through the Phase 4
+interrupt: *"this run has spent $2.40 of a $2.00 budget"*, with the same
+retry / abort buttons, where retry extends the ceiling by one more budget.
+Cost becomes an ordinary operator decision rather than a surprise on an
+invoice.
+
+The check happens at node boundaries, like `step_count`, not mid-node. One
+node's calls can therefore overshoot the ceiling; that is the price of not
+aborting an in-flight model call, and it is worth stating rather than
+discovering.
+
+**Acceptance:** a scripted run with a tiny budget escalates at the boundary and
+the alert names the amount; retry continues and abort stops; a model absent
+from the price table shows tokens only and logs exactly once; the tray shows
+dollars beside tokens.
+
+#### 5.3 Pipeline the office
+
+**The gap.** The graph advances one task at a time, so exactly one agent works
+at any moment and three sprites sit idle. The premise is an office; the
+implementation is a relay race. This is the largest distance between what the
+product claims and what it does.
+
+**Target.** Three stages in flight: the coder on task N+1 while the reviewer
+reviews N and the writer documents N-1.
+
+**Design.** Not `Send` fan-out over per-task subgraphs — with a fixed roster of
+one agent per persona there is nothing to fan out *to*, and per-task subgraphs
+would fight over the same four agents. Instead each task carries its own stage
+in run state, and a dispatcher node picks at most one task per persona per
+superstep and runs those nodes concurrently. One graph, one checkpointer, and
+escalation keeps working unchanged.
+
+**What it forces.** The reviewer must review what it was handed, not the live
+tree, because the coder is editing that tree concurrently. So `AgentOutcome`
+carries the reviewed content captured at handoff and the reviewer reads from
+that. This is strictly better than the file locks deleted in the Phase 3
+review: a snapshot removes the contention instead of serialising around it, and
+there is no lock to leak.
+
+Tile claims get exercised for the first time — two agents heading for the
+meeting table is currently unreachable.
+
+**Acceptance:** a three-task objective puts three agents in three different
+non-idle statuses within one tick; wall-clock for three tasks is materially
+under 3× a single task; and mutating a file after handoff provably does not
+change the verdict the reviewer returns.
+
+#### 5.4 Durable history and real sessions
+
+Reload the tab and every log line is gone: logs and file changes are event
+streams, and the snapshot deliberately carries neither. For a system whose
+entire product is visibility, losing the record on refresh is a defect, not a
+trade-off.
+
+Server-side per-agent ring buffers, added to the snapshot. The interaction to
+be careful about is the one `connect()` already documents: `log.append` is not
+idempotent, so if the snapshot carries logs the client must *replace* its log
+state from it rather than append, or a reconnect doubles everything.
+
+Persistence across a backend restart is out of scope — the complaint is a
+browser reload, and an in-memory ring answers it.
+
+`DEFAULT_SESSION = "dev"` is hardcoded; real session ids and a `POST /sessions`
+land here, and only here, because nothing before this point needed two.
+
+**Acceptance:** reload mid-run and the inspector still shows everything from
+before, with nothing duplicated.
+
+#### 5.5 Debt
+
+- `world.desync` is declared in all three protocol places, handled by the
+  client, and emitted by nothing. Wire it or delete it.
+- `recursion_limit: 200` is a magic number. Derive it from task count ×
+  `max_steps_per_subtask` and fail loudly rather than silently truncating a
+  legitimately long run.
+
 ---
 
 ## 7. Risk register
@@ -282,20 +437,34 @@ Reordered by what will actually hurt, with concrete mitigations rather than rest
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | **Simulation obscures rather than reveals agent work** — the office is pretty but you cannot tell what the agents are doing | High | High | Every sprite state maps 1:1 to an enum value backed by a log line. Run the two-minute comprehension test at the end of each phase; cut ornament that fails it |
-| **Token cost on long agentic runs** | High | High | Haiku for routing and summarization; strict prompt-cache prefix discipline; per-agent budget caps that trip the breaker; token counters visible in the tray from Phase 2, not Phase 4 |
+| **Token cost on long agentic runs** | High | High | Prompt-cache prefix discipline and visible token counters are **built**. Budget caps are **not** — a pathological run has no spend ceiling today, only round counters. Phase 5.2 |
 | **Infinite reviewer/coder loops** | High | High | Hard `step_count` bound in graph state (not a prompt instruction), circuit breaker, human escalation as a first-class terminal state |
 | **Protocol drift between backend and frontend** | Medium | High | Protocol changes land in all three places in one commit; a CI check compares the Pydantic schema against the TS types |
 | **Prompt cache silently never hits** | Medium | Medium | No dynamic values in system prompts; deterministic tool ordering; assert `cache_read_input_tokens > 0` in an integration test |
 | **Pathfinding glitches / sprites clipping walls** | Medium | Medium | Single `collision` layer as the sole source of walkability; A\* unit-tested against fixture maps; tile claims prevent two sprites on one tile |
 | **UI lag under event bursts** | Medium | Low | 100 ms server-side coalescing, 30 fps canvas cap, single per-tick store apply |
-| **Agent writes outside the workspace or runs an unsafe command** | Low | High | Canonical path resolution against the workspace root, executable allowlist, shell-operator rejection, container isolation |
+| **Agent writes outside the workspace or runs an unsafe command** | High | High | **Partially mitigated, and the gap is confirmed.** The file tools resolve against the workspace root; the shell tool does not check arguments at all, and its allowlist includes interpreters. Container isolation was never built. Phase 5.1 |
 
 ---
 
 ## 8. Immediate next actions
 
-1. `cd project-fable && git init` — the plan and `CLAUDE.md` are the first commit.
-2. Scaffold `backend/` and `frontend/` per §2 and the layout in `CLAUDE.md` §2.
-3. Write `docs/PROTOCOL.md` and generate both sets of models from it. This blocks everything else in Phase 1.
-4. Source or draw the office tileset and one four-direction character sheet; a placeholder is fine, but the map layer names must be final.
-5. Build the Phase 1 vertical slice and run its acceptance test before adding a second agent or a single LLM call.
+Phases 1–4 are complete and verified against their acceptance criteria, live
+against a real provider. What follows is Phase 5, in dependency order.
+
+1. **Argument confinement in `ShellTool`**, with the escape reproduction from
+   §6 Phase 5.1 as the first regression test. This is the only item on the list
+   that changes what the system is safe to be pointed at, so it goes first
+   regardless of how much more interesting 5.3 is.
+2. **The sandbox**, with visible degradation when no container runtime exists.
+3. **Budget caps and dollar display** (5.2). This precedes 5.3 because
+   pipelining multiplies concurrent token burn, and adding a ceiling after
+   raising the spend rate is the wrong order.
+4. **Pipelined dispatcher** (5.3), starting with the handoff snapshot that
+   removes reviewer/coder file contention.
+5. **Durable logs and real sessions** (5.4), then the debt in 5.5.
+
+Before starting each: re-read the phase's acceptance criteria and write the
+failing test first. Every phase so far has found its most valuable defects by
+running against a real model, not by reasoning about the code — budget at least
+one live run per phase.
