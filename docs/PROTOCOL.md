@@ -1,4 +1,4 @@
-# Project Fable — Wire Protocol v1
+# Project Fable — Wire Protocol v2
 
 **This document is the source of truth for the WebSocket contract.** `backend/app/protocol/` and `frontend/lib/protocol.ts` are mirrors of it. A protocol change lands in all three places in one commit, or it does not land.
 
@@ -23,7 +23,7 @@ Every frame in both directions uses this envelope. There are no bare events.
 
 ```json
 {
-  "v": 1,
+  "v": 2,
   "seq": 1284,
   "ts": "2026-09-04T09:12:33.412Z",
   "events": [ { "type": "agent.status", "data": { } } ]
@@ -83,7 +83,6 @@ Full authoritative state. Sent on connect and in response to a resync. Replaces 
     "started_at": "2026-09-04T09:00:00.000Z",
     "agents": { "coder-1": { /* AgentState, §5.1 */ } },
     "tasks":  { "task-3":  { /* Task, §5.2 */ } },
-    "file_locks": { "src/auth.py": "coder-1" },
     "tile_claims": [ { "tile": [12, 3], "agent_id": "coder-1" } ],
     "alerts": [ /* Alert, §5.4 */ ]
   }
@@ -245,7 +244,6 @@ Sent on task creation and on every state transition.
   "bubble": "Writing token bucket",
   "usage": { "input_tokens": 41200, "output_tokens": 9800,
              "cache_creation_input_tokens": 1024, "cache_read_input_tokens": 180224 },
-  "retry_count": 0,
   "step_count": 2
 }
 ```
@@ -340,3 +338,14 @@ Additive changes — a new event type, a new optional field, a new enum value �
 - ignore unknown event types rather than erroring, **except** that unknown `agent.status` values are a hard error (§4.4), because rendering the wrong sprite state is worse than crashing;
 - ignore unknown fields on known events;
 - never assume the absence of an optional field is meaningful.
+
+
+---
+
+## 9. Changelog
+
+**v2** — removed `WorldSnapshotData.file_locks` and `AgentState.retry_count`.
+Both were emitted on every frame and read by nothing: no agent ever took a
+file lock (the graph is sequential, so two agents cannot contend for a file),
+and `retry_count` was declared but never written, so it was always `0`. Field
+removal is a breaking change under §8, hence the version bump.

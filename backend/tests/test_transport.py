@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.protocol.events import (
+    PROTOCOL_VERSION,
     AgentStatus,
     LogStream,
     Persona,
@@ -155,7 +156,7 @@ def client() -> TestClient:
 def test_health_reports_protocol_version(client: TestClient) -> None:
     body = client.get("/health").json()
     assert body["status"] == "ok"
-    assert body["protocol_version"] == 1
+    assert body["protocol_version"] == PROTOCOL_VERSION
 
 
 def test_snapshot_has_seeded_agents_and_aliased_fields(client: TestClient) -> None:
@@ -187,7 +188,7 @@ def test_debug_move_rejects_claimed_tile(client: TestClient) -> None:
 def test_websocket_opens_with_a_snapshot(client: TestClient) -> None:
     with client.websocket_connect("/ws/dev") as ws:
         frame = ServerFrame.model_validate_json(ws.receive_text())
-        assert frame.v == 1
+        assert frame.v == PROTOCOL_VERSION
         assert frame.events[0].type == "world.snapshot"
         assert "coder-1" in frame.events[0].data.agents
 

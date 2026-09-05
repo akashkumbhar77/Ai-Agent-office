@@ -93,8 +93,6 @@ def test_every_mutation_advances_seq() -> None:
     seen.append(w.seq)
     w.arrive("coder-1")
     seen.append(w.seq)
-    w.acquire_file_lock("src/auth.py", "coder-1")
-    seen.append(w.seq)
 
     assert seen == sorted(seen), "seq must never decrease"
     assert len(set(seen)) == len(seen), "every mutation must advance seq"
@@ -194,7 +192,15 @@ def test_snapshot_emits_tile_claims_as_array() -> None:
 
 
 def test_client_frame_parses_prompt_submit() -> None:
-    wire = '{"v":1,"seq":0,"events":[{"type":"prompt.submit","data":{"text":"Add rate limiting"}}]}'
+    wire = json.dumps(
+        {
+            "v": PROTOCOL_VERSION,
+            "seq": 0,
+            "events": [
+                {"type": "prompt.submit", "data": {"text": "Add rate limiting"}}
+            ],
+        }
+    )
     parsed = ClientFrame.model_validate_json(wire)
     assert parsed.events[0].data.text == "Add rate limiting"
 

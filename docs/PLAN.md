@@ -32,7 +32,6 @@ Decisions taken up front so they are not relitigated mid-build. Each records the
 | API / transport | **FastAPI + native WebSockets** | Socket.IO — extra protocol layer for reconnection logic we control anyway |
 | Primary provider | **OpenAI** behind the `LLMProvider` interface | Anthropic — no credentials available for this build; the interface makes it a later drop-in, not a rewrite |
 | Model IDs | **Configuration only** (`PLANNING_MODEL`, `UTILITY_MODEL`), no defaults | Hardcoded IDs — a wrong guess 404s inside a retry loop instead of failing at startup |
-| Local fallback | **Ollama** behind the same interface | Provider-specific branches scattered through agent code |
 | World state | Single in-memory `WorldState` (Pydantic) — Redis deferred to Phase 4 | Redis from day one — premature; single-process is the v1 topology |
 | Rendering | **Phaser 3** in a client-only React component | PixiJS — Phaser ships tilemap parsing, arcade physics, and animation state out of the box |
 | Movement | Backend sends **movement intent**; frontend runs A\* and tweens | Backend streaming coordinates at 30 Hz — couples render rate to network, floods the socket |
@@ -216,7 +215,7 @@ Three additions beyond the original phase list, all to make the acceptance crite
 
 Goal: real agents produce real work, visible as status changes.
 
-1. `LLMProvider` interface; Anthropic implementation (streaming, adaptive thinking, tool use, structured outputs) and Ollama implementation.
+1. `LLMProvider` interface plus one real implementation and a scripted fake.
 2. Token accounting recorded per agent on every call, emitted as `agent.usage`.
 3. PM and Coder nodes with persona prompts. Prompts are stable files, not f-strings with interpolated state — this is what makes prompt caching work.
 4. Tool layer: read file, write file, list directory, run command. All path-confined and allowlisted per `CLAUDE.md` §8.

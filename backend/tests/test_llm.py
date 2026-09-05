@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
 
 import pytest
 
@@ -22,8 +21,6 @@ from app.llm.fake import (
     rate_limited,
     refusal,
 )
-from app.llm.ollama_provider import _parse_tool_calls as ollama_parse_tool_calls
-from app.llm.ollama_provider import _resolve_stop_reason
 from app.llm.openai_provider import (
     _normalize_usage,
     _parse_tool_calls,
@@ -182,44 +179,6 @@ def test_tool_spec_becomes_a_function_definition() -> None:
     )
     assert wire["type"] == "function"
     assert wire["function"]["parameters"] == {"type": "object"}
-
-
-# -- Ollama ----------------------------------------------------------------
-
-
-def test_ollama_arguments_arrive_already_decoded() -> None:
-    calls = ollama_parse_tool_calls(
-        {"tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "a"}}}]}
-    )
-    assert calls[0].arguments == {"path": "a"}
-
-
-def test_ollama_calls_get_synthesized_ids() -> None:
-    """Ollama supplies no id, but results are paired to calls by id."""
-    calls = ollama_parse_tool_calls(
-        {
-            "tool_calls": [
-                {"function": {"name": "a", "arguments": {}}},
-                {"function": {"name": "b", "arguments": {}}},
-            ]
-        }
-    )
-    ids = [c.id for c in calls]
-    assert ids == ["ollama-call-0", "ollama-call-1"]
-    assert len(set(ids)) == 2
-
-
-def test_ollama_tool_calls_imply_tool_use_stop_reason() -> None:
-    message: dict[str, Any] = {"tool_calls": [{"function": {"name": "a", "arguments": {}}}]}
-    assert _resolve_stop_reason({"done_reason": "stop"}, message) is StopReason.TOOL_USE
-
-
-def test_ollama_length_maps_to_max_tokens() -> None:
-    assert _resolve_stop_reason({"done_reason": "length"}, {}) is StopReason.MAX_TOKENS
-
-
-def test_ollama_unknown_done_reason_defaults_to_end_turn() -> None:
-    assert _resolve_stop_reason({"done_reason": "wat"}, {}) is StopReason.END_TURN
 
 
 # -- Fake provider ---------------------------------------------------------

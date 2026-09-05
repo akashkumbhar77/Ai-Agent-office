@@ -26,11 +26,11 @@ project-fable/
 │   │   ├── main.py            # FastAPI app factory, lifespan, routes
 │   │   ├── config.py          # pydantic-settings, env only
 │   │   ├── protocol/          # pydantic event models — mirrors PROTOCOL.md
-│   │   ├── world/             # WorldState, tilemap, occupancy, locks
+│   │   ├── world/             # WorldState, tilemap, tile occupancy
 │   │   ├── graph/             # LangGraph nodes, edges, checkpointer
 │   │   ├── agents/            # per-persona prompts + tool bindings
-│   │   ├── llm/               # provider clients (Anthropic, Ollama)
-│   │   ├── tools/             # MCP + local tool implementations
+│   │   ├── llm/               # provider client + FakeProvider
+│   │   ├── tools/             # workspace confinement, file + shell tools
 │   │   └── transport/         # WebSocket manager, broadcast, snapshot
 │   └── tests/
 └── frontend/
@@ -53,7 +53,7 @@ Do not create top-level directories outside this layout without saying why.
 **The backend owns state. The frontend owns rendering.**
 
 1. **The backend never sends per-frame data.** It sends *intent* — "agent `coder-1` moves from tile (4,7) to tile (12,3), duration 2400ms". The frontend computes the A\* path and tweens the sprite. Never stream coordinates at 30 Hz over the socket.
-2. **`WorldState` is the single source of truth.** Agent positions, statuses, task backlog, file locks, and token counters all live in one serializable object. Nothing derives world state from LangGraph internals or from the socket layer.
+2. **`WorldState` is the single source of truth.** Agent positions, statuses, task backlog, tile claims, and token counters all live in one serializable object. Nothing derives world state from LangGraph internals or from the socket layer.
 3. **Every outbound message is a typed event.** Define it in `app/protocol/` as a Pydantic model, mirror it in `frontend/lib/protocol.ts`, and document it in `docs/PROTOCOL.md`. No ad-hoc dicts on the wire.
 4. **The protocol is versioned.** Every frame carries `v` (protocol version) and `seq` (monotonic mutation counter). `seq` counts state mutations, not frames — a batched frame advances it by more than one, so never test for adjacency. Clients reject non-increasing `seq` and resync via `GET /world/snapshot` on reconnect, on `world.desync`, or when an event references an unknown entity.
 5. **The frontend never calls an LLM and never holds an API key.** All model access is server-side. The browser bundle must contain no provider API key, no provider base URLs with credentials, and no `NEXT_PUBLIC_` variable carrying a secret.
@@ -63,9 +63,9 @@ Do not create top-level directories outside this layout without saying why.
 
 ## 4. LLM usage rules
 
-**Nothing above `app/llm/` may import a provider SDK.** Agent personas, the graph, and the world talk in `Message`, `ToolSpec`, `LLMResponse`, and `StopReason` — never in OpenAI or Ollama types. Provider selection happens once, in `app/llm/factory.py`. If you find yourself writing `if provider == ...` outside that file, the abstraction has leaked.
+**Nothing above `app/llm/` may import a provider SDK.** Agent personas, the graph, and the world talk in `Message`, `ToolSpec`, `LLMResponse`, and `StopReason` — never in provider SDK types. Provider selection happens once, in `app/llm/factory.py`. If you find yourself writing `if provider == ...` outside that file, the abstraction has leaked.
 
-Current setup: **OpenAI is primary, Ollama is the local-dev fallback.** Both sit behind `LLMProvider`; `FakeProvider` stands in for tests.
+Current setup: **OpenAI is the only real provider**; `FakeProvider` stands in for tests. The `LLMProvider` seam stays because it earned its place — it turned an Anthropic→OpenAI switch into a config change — but a second implementation arrives when a second one is actually needed, not before.
 
 - **Model IDs are configuration, never literals.** `PLANNING_MODEL` (planning, architecture, code generation) and `UTILITY_MODEL` (routing, classification, status text) come from the environment and have no defaults. A guessed ID 404s at request time inside a retry loop; a missing one fails loudly at startup. Do not hardcode a model ID anywhere, including in tests.
 - **Normalize at the boundary, not downstream.** Each provider maps its own accounting into the four-field `TokenUsage` and its own finish reasons into `StopReason`. Two rules follow:
@@ -192,10 +192,8 @@ which goes green independently and earlier.
 Required environment (`backend/.env`):
 
 ```
-LLM_PROVIDER=openai             # openai | ollama
-OPENAI_API_KEY=...              # required when LLM_PROVIDER=openai
+OPENAI_API_KEY=...              # required
 OPENAI_BASE_URL=                # optional: gateway / compatible endpoint
-OLLAMA_BASE_URL=http://localhost:11434
 
 # No defaults. Startup fails if either is missing or blank.
 PLANNING_MODEL=

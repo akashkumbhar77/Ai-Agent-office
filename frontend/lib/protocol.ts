@@ -1,12 +1,12 @@
 /**
- * Wire protocol v1 — mirror of docs/PROTOCOL.md.
+ * Wire protocol v2 — mirror of docs/PROTOCOL.md.
  *
  * This file is one of three places the protocol lives; the others are
  * docs/PROTOCOL.md (source of truth) and backend/app/protocol/events.py.
  * A change to one is a change to all three, in the same commit.
  */
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export type Tile = [number, number];
 
@@ -93,7 +93,6 @@ export interface AgentState {
   current_task_id: string | null;
   bubble: string | null;
   usage: TokenUsage;
-  retry_count: number;
   step_count: number;
 }
 
@@ -140,7 +139,6 @@ export interface WorldSnapshotData {
   started_at: string;
   agents: Record<string, AgentState>;
   tasks: Record<string, Task>;
-  file_locks: Record<string, string>;
   tile_claims: TileClaim[];
   alerts: Alert[];
 }

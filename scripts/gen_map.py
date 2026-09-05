@@ -37,7 +37,6 @@ DESKS: list[tuple[int, int]] = [
     (20, 16), (24, 16),            # right room, south bank
 ]
 TABLE_RECT = (3, 8, 4, 2)  # x, y, w, h — the meeting room
-COFFEE: list[tuple[int, int]] = [(5, 16), (8, 16)]
 
 
 def build_walls() -> set[tuple[int, int]]:
@@ -124,10 +123,6 @@ def main() -> None:
             assert (x, y) not in walls, f"table tile {(x, y)} is inside a wall"
             furniture_data[y * WIDTH + x] = TABLE
 
-    for x, y in COFFEE:
-        assert (x, y) not in walls, f"coffee tile {(x, y)} is inside a wall"
-        furniture_data[y * WIDTH + x] = TABLE
-
     # Connectivity: every walkable tile must be reachable from the spawn
     # corner, and every desk must be reachable. An isolated pocket here
     # becomes an unexplainable "agent won't move" bug later.
@@ -182,7 +177,6 @@ def main() -> None:
             "meeting": [list(t) for t in (
                 (tx + dx, ty + dy) for dy in range(th) for dx in range(tw)
             )],
-            "breakroom": [list(c) for c in COFFEE],
         },
     }
 

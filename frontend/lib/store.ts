@@ -111,7 +111,6 @@ export const useFableStore = create<FableState>((set) => ({
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
               },
-              retry_count: 0,
               step_count: 0,
             },
           };

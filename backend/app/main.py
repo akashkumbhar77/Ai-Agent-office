@@ -102,22 +102,6 @@ async def world_snapshot(session_id: str = DEFAULT_SESSION) -> WorldSnapshot:
     return require_session(session_id).world.snapshot()
 
 
-@app.get("/world/map")
-async def world_map(session_id: str = DEFAULT_SESSION) -> dict[str, object]:
-    """Map metadata for the debug harness — desks and rooms by name, so a
-    human can say 'move to desk 3' instead of computing tile coordinates."""
-    tm = require_session(session_id).tilemap
-    return {
-        "map_id": tm.map_id,
-        "width": tm.width,
-        "height": tm.height,
-        "tile_size": tm.tile_size,
-        "desks": [list(d) for d in tm.desks],
-        "meeting": [list(t) for t in tm.meeting],
-        "breakroom": [list(b) for b in tm.breakroom],
-    }
-
-
 class DebugMoveRequest(BaseModel):
     agent_id: str = "coder-1"
     to: Tile

@@ -28,7 +28,6 @@ class TileMap(BaseModel):
     blocked: set[Tile]
     desks: list[Tile]
     meeting: list[Tile]
-    breakroom: list[Tile]
 
     def in_bounds(self, tile: Tile) -> bool:
         x, y = tile
@@ -84,5 +83,4 @@ def load_tilemap(path: Path, map_id: str) -> TileMap:
         blocked=blocked,
         desks=tiles("desks"),
         meeting=tiles("meeting"),
-        breakroom=tiles("breakroom"),
     )

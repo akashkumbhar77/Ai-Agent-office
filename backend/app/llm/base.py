@@ -2,7 +2,7 @@
 
 Everything above this module — agent personas, the graph, the world — talks in
 these types and never sees a provider SDK. That is what lets the same graph
-run against OpenAI, a local Ollama model, or a scripted fake in tests
+run against a real provider or a scripted fake in tests
 (CLAUDE.md §5).
 
 Two normalizations happen at this boundary and nowhere else:
@@ -53,7 +53,6 @@ class Message:
     tool_calls: list[ToolCall] = field(default_factory=list)
     # Set only on Role.TOOL messages: which call this result answers.
     tool_call_id: str | None = None
-    is_error: bool = False
 
 
 @dataclass(frozen=True)

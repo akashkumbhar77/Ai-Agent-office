@@ -1,4 +1,4 @@
-"""Wire protocol v1 — mirror of docs/PROTOCOL.md.
+"""Wire protocol v2 — mirror of docs/PROTOCOL.md.
 
 This module is one of three places the protocol lives; the others are
 docs/PROTOCOL.md (source of truth) and frontend/lib/protocol.ts. A change to
@@ -13,7 +13,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 Tile = tuple[int, int]
 
@@ -120,7 +120,6 @@ class AgentState(BaseModel):
     current_task_id: str | None = None
     bubble: str | None = None
     usage: TokenUsage = Field(default_factory=TokenUsage)
-    retry_count: int = 0
     step_count: int = 0
 
 
@@ -171,7 +170,6 @@ class WorldSnapshotData(BaseModel):
     started_at: datetime
     agents: dict[str, AgentState]
     tasks: dict[str, Task]
-    file_locks: dict[str, str]
     tile_claims: list[TileClaim]
     alerts: list[Alert]
 

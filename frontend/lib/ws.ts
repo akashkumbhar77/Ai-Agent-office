@@ -151,22 +151,4 @@ export class FableSocket {
   }
 }
 
-export interface MapMeta {
-  map_id: string;
-  width: number;
-  height: number;
-  tile_size: number;
-  desks: [number, number][];
-  meeting: [number, number][];
-  breakroom: [number, number][];
-}
-
-export async function fetchMapMeta(sessionId: string): Promise<MapMeta> {
-  const res = await fetch(
-    `${API_BASE}/world/map?session_id=${encodeURIComponent(sessionId)}`,
-  );
-  if (!res.ok) throw new Error(`map meta ${res.status}`);
-  return (await res.json()) as MapMeta;
-}
-
 export { API_BASE };

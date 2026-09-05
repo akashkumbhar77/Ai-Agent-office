@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,11 +13,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # --- LLM ---------------------------------------------------------------
-    llm_provider: Literal["openai", "ollama"] = "openai"
     openai_api_key: str | None = None
     # Optional override for gateways and compatible endpoints.
     openai_base_url: str | None = None
-    ollama_base_url: str = "http://localhost:11434"
 
     # Deliberately no defaults, and min_length=1 so a blank value in .env is
     # rejected too. A guessed or empty model ID fails at request time with a
@@ -55,10 +52,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _require_provider_credentials(self) -> Settings:
-        if self.llm_provider == "openai" and not self.openai_api_key:
+        if not self.openai_api_key:
             raise ValueError(
-                "LLM_PROVIDER=openai but OPENAI_API_KEY is unset. Set it in "
-                "backend/.env (gitignored) or export it."
+                "OPENAI_API_KEY is unset. Set it in backend/.env (gitignored) "
+                "or export it."
             )
         return self
 

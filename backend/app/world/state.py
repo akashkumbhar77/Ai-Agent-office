@@ -1,7 +1,7 @@
 """Authoritative world state.
 
 The World object is the single source of truth for agent positions, statuses,
-tasks, locks, and token accounting. Nothing derives world state from LangGraph
+tasks, tile claims, and token accounting. Nothing derives world state from LangGraph
 internals or from the transport layer (CLAUDE.md §3).
 
 Every mutation does two things atomically: update state, and append the
@@ -54,7 +54,7 @@ def _now() -> datetime:
 
 
 class LockConflict(Exception):
-    """Raised when an agent requests a file lock or tile another agent holds."""
+    """Raised when an agent targets a tile another agent holds."""
 
     def __init__(self, resource: str, holder: str) -> None:
         super().__init__(f"{resource} is held by {holder}")
@@ -71,7 +71,6 @@ class World:
 
         self.agents: dict[str, AgentState] = {}
         self.tasks: dict[str, Task] = {}
-        self.file_locks: dict[str, str] = {}
         self.tile_claims: dict[Tile, str] = {}
         self.alerts: dict[str, Alert] = {}
 
@@ -102,7 +101,6 @@ class World:
                 started_at=self.started_at,
                 agents=dict(self.agents),
                 tasks=dict(self.tasks),
-                file_locks=dict(self.file_locks),
                 tile_claims=[
                     TileClaim(tile=tile, agent_id=agent_id)
                     for tile, agent_id in self.tile_claims.items()
@@ -245,20 +243,6 @@ class World:
             task.assignee = assignee
         self.upsert_task(task)
         return task
-
-    # -- locks -------------------------------------------------------------
-
-    def acquire_file_lock(self, path: str, agent_id: str) -> None:
-        holder = self.file_locks.get(path)
-        if holder is not None and holder != agent_id:
-            raise LockConflict(path, holder)
-        self.file_locks[path] = agent_id
-        self.seq += 1
-
-    def release_file_lock(self, path: str, agent_id: str) -> None:
-        if self.file_locks.get(path) == agent_id:
-            del self.file_locks[path]
-            self.seq += 1
 
     # -- logs, files, alerts ----------------------------------------------
 

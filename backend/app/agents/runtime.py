@@ -56,7 +56,6 @@ _BUBBLES: dict[str, str] = {
 class AgentOutcome:
     text: str
     stopped: Stopped
-    iterations: int
     control: list[ControlSignal] = field(default_factory=list)
     # Files this agent touched. The reviewer cannot review a change it
     # cannot see, so this is how the diff reaches the next node.
@@ -100,13 +99,14 @@ class AgentRunner:
             self.spec.agent_id, AgentStatus.WORKING, _BUBBLES["thinking"]
         )
 
-        for iteration in range(1, self.max_iterations + 1):
+        # A bounded repeat: the count is the cap, nothing reads the index.
+        for _ in range(self.max_iterations):
             try:
                 response = await self._complete_with_retry(history, specs)
             except LLMError as exc:
                 self.world.set_status(self.spec.agent_id, AgentStatus.IDLE, None)
                 return AgentOutcome(
-                    text="", stopped="provider_error", iterations=iteration,
+                    text="", stopped="provider_error",
                     control=control, effects=effects, error=str(exc),
                 )
 
@@ -120,7 +120,7 @@ class AgentRunner:
             if response.stop_reason is StopReason.REFUSAL:
                 self.world.set_status(self.spec.agent_id, AgentStatus.IDLE, None)
                 return AgentOutcome(
-                    text=response.text, stopped="refusal", iterations=iteration,
+                    text=response.text, stopped="refusal",
                     control=control, effects=effects,
                     error="the model declined this request",
                 )
@@ -130,7 +130,7 @@ class AgentRunner:
                 # sentence, so stop and report rather than guess.
                 self.world.set_status(self.spec.agent_id, AgentStatus.IDLE, None)
                 return AgentOutcome(
-                    text=response.text, stopped="max_tokens", iterations=iteration,
+                    text=response.text, stopped="max_tokens",
                     control=control, effects=effects,
                     error=f"response hit the {self.max_tokens}-token cap",
                 )
@@ -138,7 +138,7 @@ class AgentRunner:
             if response.stop_reason is not StopReason.TOOL_USE:
                 self.world.set_status(self.spec.agent_id, AgentStatus.IDLE, None)
                 return AgentOutcome(
-                    text=response.text, stopped="end_turn", iterations=iteration,
+                    text=response.text, stopped="end_turn",
                     control=control, effects=effects,
                 )
 
@@ -188,7 +188,6 @@ class AgentRunner:
                         role=Role.TOOL,
                         content=dispatch.result.content,
                         tool_call_id=call.id,
-                        is_error=dispatch.result.is_error,
                     )
                 )
 
@@ -205,7 +204,7 @@ class AgentRunner:
         # as success is how a runaway agent looks green on a dashboard.
         self.world.set_status(self.spec.agent_id, AgentStatus.ESCALATED, "stuck")
         return AgentOutcome(
-            text="", stopped="max_iterations", iterations=self.max_iterations,
+            text="", stopped="max_iterations",
             control=control, effects=effects,
             error=f"made {self.max_iterations} tool rounds without finishing",
         )
